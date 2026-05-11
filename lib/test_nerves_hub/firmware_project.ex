@@ -72,8 +72,13 @@ defmodule TestNervesHub.FirmwareProject do
   end
 
   defp ensure_nerves_hub_link(path) do
-    # `mix igniter.install` will be a no-op if already present.
-    case run("mix", ["igniter.install", "nerves_hub_link", "--yes"], cd: path) do
+    # `NERVES_HUB_LINK_PACKAGE` lets a developer point the firmware at a
+    # local checkout or a feature branch by passing igniter's native
+    # `package@git:`, `package@github:`, or `package@path:` syntax. The
+    # default hex install becomes the bare `nerves_hub_link` spec.
+    package = Config.nerves_hub_link_package()
+
+    case run("mix", ["igniter.install", package, "--yes", "--yes-to-deps"], cd: path) do
       {_out, 0} -> :ok
       {out, code} -> {:error, {:igniter_install_failed, code, out}}
     end

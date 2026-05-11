@@ -103,7 +103,7 @@ defmodule TestNervesHub.Case do
     Map.put(context, :device, device)
   end
 
-  defp build_firmware(slug, :shared_secret, fixtures) do
+  defp build_firmware(_slug, :shared_secret, fixtures) do
     {key, secret} = Org.create_shared_secret_auth(fixtures.product)
 
     server = %{

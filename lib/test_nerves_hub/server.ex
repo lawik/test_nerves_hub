@@ -74,6 +74,7 @@ defmodule TestNervesHub.Server do
 
     :ok = ensure_postgres_database!(pg)
     :ok = ensure_clickhouse_database!(ch)
+    :ok = prepare_web_project!()
     :ok = run_migrations!(pg, ch)
 
     suffix = :erlang.unique_integer([:positive])
@@ -117,6 +118,12 @@ defmodule TestNervesHub.Server do
 
   @impl true
   def handle_info({port, {:data, data}}, %State{port: port} = state) do
+    # Tee everything to a file so we can grep for auth/socket events
+    # after a failing test, without having to keep the buffer in memory.
+    log_path = Path.join(Config.work_dir(), "nerves_hub_web.log")
+    File.mkdir_p!(Path.dirname(log_path))
+    File.write!(log_path, data, [:append])
+
     if String.contains?(data, "[error]") or String.contains?(data, "[warning]") do
       Logger.debug("nerves_hub_web: #{String.trim(data)}")
     end
@@ -240,6 +247,23 @@ defmodule TestNervesHub.Server do
     end
 
     GenServer.stop(conn)
+    :ok
+  end
+
+  # Triggers the clone (if any) via Config.nerves_hub_web_path/0 and
+  # makes sure deps are fetched. A fresh checkout will fail `ecto.migrate`
+  # otherwise. Idempotent against an already-resolved local checkout.
+  defp prepare_web_project! do
+    web_path = Config.nerves_hub_web_path()
+
+    {out, code} =
+      System.cmd("mix", ["deps.get"],
+        cd: web_path,
+        env: [{"MIX_ENV", "dev"}],
+        stderr_to_stdout: true
+      )
+
+    if code != 0, do: raise("mix deps.get failed in #{web_path} (status #{code}):\n#{out}")
     :ok
   end
 

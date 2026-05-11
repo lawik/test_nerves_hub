@@ -288,8 +288,32 @@ defmodule TestNervesHub.QEMU do
 
     %{
       executable: System.find_executable(executable) || raise("#{executable} not found"),
-      args: args,
+      # The template MAC `fe:db:ed:de:d0:01` is the same across runs, which
+      # means Nerves derives the same device identifier every time
+      # (Nerves.Runtime.serial_number/0 hashes the MAC). NervesHub then
+      # rejects the second device for the new product as a duplicate
+      # identifier. Substituting a random locally-administered MAC per
+      # instance gives each QEMU device a unique identifier.
+      args: replace_mac(args, random_locally_administered_mac()),
       env: env
     }
+  end
+
+  defp replace_mac(args, mac) do
+    Enum.map(args, fn arg ->
+      Regex.replace(~r/mac=[0-9a-fA-F:]{17}/, arg, "mac=#{mac}")
+    end)
+  end
+
+  # Locally-administered, unicast MAC (`x2:..`, `x6:..`, `xA:..`, `xE:..`).
+  # Picking the locally-administered range keeps us out of any vendor space.
+  defp random_locally_administered_mac do
+    [first | rest] = for _ <- 1..6, do: :crypto.strong_rand_bytes(1) |> :binary.first()
+    first = Bitwise.bor(Bitwise.band(first, 0xFC), 0x02)
+
+    [first | rest]
+    |> Enum.map(&:io_lib.format("~2.16.0B", [&1]))
+    |> Enum.join(":")
+    |> String.downcase()
   end
 end
