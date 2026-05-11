@@ -79,10 +79,10 @@ defmodule TestNervesHub.QEMU do
         :binary,
         :exit_status,
         :stderr_to_stdout,
-        :hide,
-        args: cmd.args,
-        env: cmd.env,
-        cd: opts.project_path
+        {:args, cmd.args},
+        {:env,
+         Enum.map(cmd.env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)},
+        {:cd, String.to_charlist(opts.project_path)}
       ])
 
     {:ok,
@@ -137,6 +137,14 @@ defmodule TestNervesHub.QEMU do
 
   @impl true
   def terminate(_reason, %State{port: port}) when is_port(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} ->
+        System.cmd("kill", ["-TERM", to_string(os_pid)], stderr_to_stdout: true)
+
+      _ ->
+        :ok
+    end
+
     if Port.info(port), do: Port.close(port)
     :ok
   end
@@ -146,9 +154,10 @@ defmodule TestNervesHub.QEMU do
   # --- internals ---
 
   # The "ready" signal is the first IEx prompt we see in the buffer.
-  # Nerves uses `iex(app@nerves)1>` style prompts by default.
+  # Matches both `iex(1)>` (default Nerves boot, not distributed) and the
+  # `iex(app@host)1>` form that appears when a node name is set.
   defp maybe_detect_ready(%State{ready?: false} = state) do
-    if Regex.match?(~r/iex\(.*\)\d+>/, state.buffer) do
+    if Regex.match?(~r/iex\(\d+\)>|iex\([^)]+\)\d+>/, state.buffer) do
       state = %{state | ready?: true, buffer: ""}
 
       case state.awaiting do
@@ -168,8 +177,8 @@ defmodule TestNervesHub.QEMU do
 
   defp maybe_drain_eval(%State{awaiting: {:eval, from, marker, _}} = state) do
     buffer = state.buffer
-    begin_token = "<<BEGIN:" <> marker <> ">>"
-    end_token = "<<END:" <> marker <> ">>"
+    begin_token = "<<BEG" <> "IN:" <> marker <> ">>"
+    end_token = "<<E" <> "ND:" <> marker <> ">>"
 
     with {:ok, _, rest} <- split_on(buffer, begin_token),
          {:ok, captured, after_end} <- split_on(rest, end_token) do
@@ -190,12 +199,23 @@ defmodule TestNervesHub.QEMU do
     end
   end
 
-  # The on-device snippet prints a marker, then a base64'd binary term of the
-  # result. base64 keeps it on one line and binary-term keeps Elixir terms.
+  # IEx echoes whatever we type before evaluating. If we embed the full
+  # marker string in the source, it appears twice in the buffer (once
+  # echoed, once printed at runtime) and we can't tell them apart.
+  #
+  # Workaround: assemble the marker on-device from pieces so the source
+  # itself never contains the literal marker string. The IO.puts at
+  # runtime then prints the only contiguous occurrence in the buffer.
   defp wrap_for_eval(source, marker) do
+    [b1, b2] = ["<<BEG", "IN:#{marker}>>"]
+    [e1, e2] = ["<<E", "ND:#{marker}>>"]
+
+    # Keep newlines — IEx tracks expression completion via paren balance,
+    # so multi-line input works as long as the trailing `end).()` arrives.
     """
     (fn ->
-      IO.puts("<<BEGIN:#{marker}>>")
+      __tnh_begin = "#{b1}" <> "#{b2}"
+      __tnh_end = "#{e1}" <> "#{e2}"
       result = try do
         {:ok, (#{source})}
       rescue
@@ -203,21 +223,26 @@ defmodule TestNervesHub.QEMU do
       catch
         kind, reason -> {:error, {kind, inspect(reason)}}
       end
+      IO.puts(__tnh_begin)
       IO.puts(Base.encode64(:erlang.term_to_binary(result)))
-      IO.puts("<<END:#{marker}>>")
+      IO.puts(__tnh_end)
     end).()
     """
-    |> String.replace("\n", " ")
   end
 
+  # The captured block contains a base64-encoded binary, but the serial
+  # TTY wraps long lines at ~80 columns. Collect every base64-shaped line
+  # and concatenate before decoding so we can pass back large terms.
   defp parse_capture(captured) do
-    line =
+    joined =
       captured
-      |> String.split("\n", trim: true)
-      |> Enum.find(fn l -> Regex.match?(~r/^[A-Za-z0-9+\/=]+$/, String.trim(l)) end)
+      |> String.split("\n")
+      |> Enum.map(&String.trim/1)
+      |> Enum.filter(&Regex.match?(~r/^[A-Za-z0-9+\/=]+$/, &1))
+      |> Enum.join("")
 
-    with bin when is_binary(bin) <- line,
-         {:ok, raw} <- Base.decode64(String.trim(bin)),
+    with true <- joined != "",
+         {:ok, raw} <- Base.decode64(joined),
          {:ok, term} <- safe_binary_to_term(raw) do
       term
     else
@@ -225,25 +250,46 @@ defmodule TestNervesHub.QEMU do
     end
   end
 
+  # We deliberately skip `:safe` here. The device frequently sends atoms
+  # for module names (e.g. NervesHubLink.Configurator.SharedSecret) that
+  # don't exist on the runner side. Trust is fine — the test runner owns
+  # the device.
   defp safe_binary_to_term(raw) do
-    {:ok, :erlang.binary_to_term(raw, [:safe])}
+    {:ok, :erlang.binary_to_term(raw)}
   rescue
     _ -> {:error, :bad_term}
   end
 
-  # `mix qemu` is provided by nerves_system_qemu_aarch64 and resolved through
-  # the firmware project's deps, so we shell out to mix in that project dir.
+  # `mix nerves.gen.qemu` (from nerves_system_qemu_aarch64) creates a disk
+  # image from the .fw and prints a `qemu-system-aarch64 ...` command line.
+  # We capture that output, parse it, and spawn qemu directly so we can
+  # attach the VM's serial console to our Port's stdin/stdout.
   defp build_qemu_command(opts) do
     target = Application.get_env(:test_nerves_hub, :qemu_target) || Config.qemu_target()
 
+    env = [
+      {"MIX_TARGET", target},
+      {"MIX_ENV", "dev"}
+    ]
+
+    {out, 0} =
+      System.cmd("mix", ["nerves.gen.qemu", opts.firmware],
+        cd: opts.project_path,
+        env: env,
+        stderr_to_stdout: true
+      )
+
+    [_, command_block] = String.split(out, "Command:\n", parts: 2)
+
+    [executable | args] =
+      command_block
+      |> String.replace("\\\n", " ")
+      |> String.split(~r/\s+/, trim: true)
+
     %{
-      executable: System.find_executable("mix") || raise("mix not found"),
-      args: ["qemu"],
-      env: [
-        {"MIX_TARGET", target},
-        {"MIX_ENV", "dev"},
-        {"NERVES_FW_IMAGE", opts.firmware}
-      ]
+      executable: System.find_executable(executable) || raise("#{executable} not found"),
+      args: args,
+      env: env
     }
   end
 end

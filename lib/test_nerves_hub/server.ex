@@ -48,8 +48,8 @@ defmodule TestNervesHub.Server do
   """
   @spec rpc(module(), atom(), list(), timeout()) :: any()
   def rpc(mod, fun, args, timeout \\ 30_000) do
-    node = node_name()
-    ensure_connected!(node)
+    {node, cookie} = GenServer.call(__MODULE__, :node_and_cookie)
+    ensure_connected!(node, cookie)
     :erpc.call(node, mod, fun, args, timeout)
   end
 
@@ -74,9 +74,11 @@ defmodule TestNervesHub.Server do
 
     :ok = ensure_postgres_database!(pg)
     :ok = ensure_clickhouse_database!(ch)
+    :ok = run_migrations!(pg, ch)
 
-    cookie = "test_nerves_hub_#{:erlang.unique_integer([:positive])}"
-    node = :"nerves_hub@127.0.0.1"
+    suffix = :erlang.unique_integer([:positive])
+    cookie = "test_nerves_hub_#{suffix}"
+    node = :"nerves_hub_#{suffix}@127.0.0.1"
 
     port = start_phoenix(pg, ch, node, cookie)
 
@@ -99,11 +101,19 @@ defmodule TestNervesHub.Server do
   end
 
   def handle_call(:await_ready, _from, state) do
-    result = poll_http(state.web_port, @startup_timeout)
+    result =
+      with :ok <- poll_http(state.web_port, @startup_timeout),
+           :ok <- poll_node(state.node, state.cookie, @startup_timeout) do
+        :ok
+      end
+
     {:reply, result, %{state | ready?: result == :ok}}
   end
 
   def handle_call(:node_name, _from, state), do: {:reply, state.node, state}
+
+  def handle_call(:node_and_cookie, _from, state),
+    do: {:reply, {state.node, state.cookie}, state}
 
   @impl true
   def handle_info({port, {:data, data}}, %State{port: port} = state) do
@@ -123,6 +133,14 @@ defmodule TestNervesHub.Server do
 
   @impl true
   def terminate(_reason, %State{port: port}) when is_port(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} ->
+        System.cmd("kill", ["-TERM", to_string(os_pid)], stderr_to_stdout: true)
+
+      _ ->
+        :ok
+    end
+
     if Port.info(port), do: Port.close(port)
     :ok
   end
@@ -150,16 +168,39 @@ defmodule TestNervesHub.Server do
       :binary,
       :exit_status,
       :stderr_to_stdout,
-      :hide,
-      args: ["phx.server"],
-      env: env,
-      cd: web_path
+      {:args, ["phx.server"]},
+      {:env, Enum.map(env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)},
+      {:cd, String.to_charlist(web_path)}
     ])
   end
 
   defp poll_http(port, timeout) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_poll_http(port, deadline)
+  end
+
+  # Verifies we can reach the RPC node AND that NervesHub.Accounts is loaded.
+  # Without this, await_ready can succeed against a stale server still bound
+  # to the HTTP port while our newly-spawned server failed to start.
+  defp poll_node(node, cookie, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    _ = Node.set_cookie(node, cookie)
+    do_poll_node(node, deadline)
+  end
+
+  defp do_poll_node(node, deadline) do
+    with true <- Node.connect(node),
+         {:module, _} <- :erpc.call(node, Code, :ensure_loaded, [NervesHub.Accounts], 5_000) do
+      :ok
+    else
+      _ ->
+        if System.monotonic_time(:millisecond) > deadline do
+          {:error, :rpc_not_ready}
+        else
+          Process.sleep(500)
+          do_poll_node(node, deadline)
+        end
+    end
   end
 
   defp do_poll_http(port, deadline) do
@@ -202,6 +243,25 @@ defmodule TestNervesHub.Server do
     :ok
   end
 
+  defp run_migrations!(pg, ch) do
+    web_path = Config.nerves_hub_web_path()
+
+    env = [
+      {"DATABASE_URL", database_url(pg)},
+      {"CLICKHOUSE_URL", clickhouse_url(ch)},
+      {"MIX_ENV", "dev"}
+    ]
+
+    {out, code} =
+      System.cmd("mix", ["ecto.migrate"], cd: web_path, env: env, stderr_to_stdout: true)
+
+    if code != 0 do
+      raise "ecto.migrate failed (status #{code}):\n#{out}"
+    end
+
+    :ok
+  end
+
   defp ensure_clickhouse_database!(ch) do
     body = "CREATE DATABASE IF NOT EXISTS #{ch[:database]}"
 
@@ -217,11 +277,15 @@ defmodule TestNervesHub.Server do
   end
 
   defp clickhouse_url(ch) do
-    base = String.trim_trailing(ch[:url], "/")
-    base <> "/?database=" <> ch[:database]
+    %URI{} = uri = URI.parse(ch[:url])
+    %{uri | path: "/" <> ch[:database], query: nil} |> URI.to_string()
   end
 
-  defp ensure_connected!(node) do
+  defp ensure_connected!(node, cookie) do
+    # Per-node cookie: lets us talk to the nerves_hub_web node without
+    # globally overwriting our cookie for other connections.
+    _ = Node.set_cookie(node, cookie)
+
     case Node.connect(node) do
       true -> :ok
       :ignored -> raise "Local node not alive — start with --name/--sname"

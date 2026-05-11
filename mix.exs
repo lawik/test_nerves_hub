@@ -26,7 +26,8 @@ defmodule TestNervesHub.MixProject do
     [
       {:req, "~> 0.5"},
       {:jason, "~> 1.4"},
-      {:postgrex, "~> 0.19"}
+      {:postgrex, "~> 0.19"},
+      {:nerves_hub_cli, path: "../nerves_hub_cli", runtime: false}
     ]
   end
 end

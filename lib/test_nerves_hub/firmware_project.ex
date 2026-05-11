@@ -39,7 +39,6 @@ defmodule TestNervesHub.FirmwareProject do
 
     with :ok <- ensure_project(path, opts.name),
          :ok <- ensure_nerves_hub_link(path),
-         :ok <- write_ca_cert(path, opts.server),
          :ok <- write_auth_files(path, opts.auth),
          :ok <- patch_target_config(path, opts) do
       {:ok, path}
@@ -80,24 +79,7 @@ defmodule TestNervesHub.FirmwareProject do
     end
   end
 
-  defp write_ca_cert(_path, %{ca_pem: nil}), do: :ok
-
-  defp write_ca_cert(path, %{ca_pem: pem}) when is_binary(pem) do
-    dest = Path.join([path, "priv", "ca.pem"])
-    File.mkdir_p!(Path.dirname(dest))
-    File.write!(dest, pem)
-    :ok
-  end
-
-  defp write_auth_files(_path, {:shared_secret, _, _}), do: :ok
-
-  defp write_auth_files(path, {:local_cert, cert_pem, key_pem}) do
-    priv = Path.join(path, "priv")
-    File.mkdir_p!(priv)
-    File.write!(Path.join(priv, "device-cert.pem"), cert_pem)
-    File.write!(Path.join(priv, "device-key.pem"), key_pem)
-    :ok
-  end
+  defp write_auth_files(_path, _auth), do: :ok
 
   defp patch_target_config(path, opts) do
     config_path = Path.join([path, "config", "target.exs"])
@@ -120,37 +102,84 @@ defmodule TestNervesHub.FirmwareProject do
     :ok
   end
 
+  # nerves_hub_web's dev/test fixtures ship a server cert for the hostname
+  # below. SNI must match so peer verification succeeds even though the
+  # underlying network connection is to an IP (10.0.2.2 in QEMU user-mode
+  # networking).
+  @server_cert_hostname "device.nerves-hub.org"
+
+  # NervesHubLink builds the websocket URL from `:host` and only consults
+  # `:port` for `device_api_*` style config. We embed scheme+port directly
+  # into `:host` so the resulting URL carries the right port (otherwise
+  # the device probes 10.0.2.2:443 and the connection never lifts off).
+  #
+  # We embed the CA / device cert PEMs directly in the config rather than
+  # writing them to the rootfs because SharedSecret.build/1 does
+  # `Keyword.put_new(:cacerts, default_certs)` — if we use `:cacertfile`
+  # our file is silently ignored and TLS fails with "Unknown CA". Setting
+  # `:cacerts` explicitly keeps SharedSecret's put_new a no-op.
   defp config_snippet(%{auth: {:shared_secret, key, secret}, server: server}) do
+    cacerts_literal = ca_pem_to_cacerts_literal(server.ca_pem)
+
     """
+    __tnh_cacerts = #{cacerts_literal}
+
     config :nerves_hub_link,
       configurator: NervesHubLink.Configurator.SharedSecret,
-      host: #{inspect(server.host)},
-      port: #{server.device_port},
+      host: "wss://#{server.host}:#{server.device_port}",
       shared_secret: [
         product_key: #{inspect(key)},
         product_secret: #{inspect(secret)}
       ],
       ssl: [
-        cacertfile: "/root/ca.pem",
+        cacerts: __tnh_cacerts,
         verify: :verify_peer,
-        server_name_indication: ~c"#{server.host}"
+        server_name_indication: ~c"#{@server_cert_hostname}"
       ]
     """
   end
 
-  defp config_snippet(%{auth: {:local_cert, _, _}, server: server}) do
+  defp config_snippet(%{auth: {:local_cert, cert_pem, key_pem}, server: server}) do
+    cacerts_literal = ca_pem_to_cacerts_literal(server.ca_pem)
+    cert_der_literal = pem_to_der_literal(cert_pem)
+    key_der_literal = key_pem_to_der_literal(key_pem)
+
     """
+    __tnh_cacerts = #{cacerts_literal}
+    __tnh_cert = #{cert_der_literal}
+    __tnh_key = #{key_der_literal}
+
     config :nerves_hub_link,
-      host: #{inspect(server.host)},
-      port: #{server.device_port},
+      host: "wss://#{server.host}:#{server.device_port}",
       ssl: [
-        cacertfile: "/root/ca.pem",
-        certfile: "/root/device-cert.pem",
-        keyfile: "/root/device-key.pem",
+        cacerts: __tnh_cacerts,
+        cert: __tnh_cert,
+        key: __tnh_key,
         verify: :verify_peer,
-        server_name_indication: ~c"#{server.host}"
+        server_name_indication: ~c"#{@server_cert_hostname}"
       ]
     """
+  end
+
+  # Pre-decode PEMs at firmware-project-generation time so the literal we
+  # splice into target.exs is just bytes — no file IO at runtime on the
+  # device, and the SharedSecret default-cacerts merge can't clobber us.
+  defp ca_pem_to_cacerts_literal(pem) when is_binary(pem) do
+    pem
+    |> :public_key.pem_decode()
+    |> Enum.map(fn {_, der, _} -> der end)
+    |> inspect(limit: :infinity, printable_limit: :infinity, binaries: :as_binaries)
+  end
+
+  defp pem_to_der_literal(pem) when is_binary(pem) do
+    [{_, der, _} | _] = :public_key.pem_decode(pem)
+    inspect(der, limit: :infinity, printable_limit: :infinity, binaries: :as_binaries)
+  end
+
+  defp key_pem_to_der_literal(pem) when is_binary(pem) do
+    [{type, der, _} | _] = :public_key.pem_decode(pem)
+    # Erlang's ssl :key option wants `{type, der}`
+    inspect({type, der}, limit: :infinity, printable_limit: :infinity, binaries: :as_binaries)
   end
 
   defp run(cmd, args, opts) do

@@ -5,7 +5,7 @@ import Config
 # a developer's local nerves_hub_dev / nerves_hub_test databases.
 config :test_nerves_hub,
   nerves_hub_web_path:
-    System.get_env("NERVES_HUB_WEB_PATH", Path.expand("../nerves_hub_web", __DIR__)),
+    System.get_env("NERVES_HUB_WEB_PATH", Path.expand("../../nerves_hub_web", __DIR__)),
   work_dir: System.get_env("TEST_NERVES_HUB_WORK_DIR", Path.expand("../work", __DIR__)),
   qemu_target: System.get_env("MIX_TARGET", "qemu_aarch64"),
   postgres: [
