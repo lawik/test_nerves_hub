@@ -288,13 +288,19 @@ defmodule TestNervesHub.QEMU do
 
     %{
       executable: System.find_executable(executable) || raise("#{executable} not found"),
-      # The template MAC `fe:db:ed:de:d0:01` is the same across runs, which
-      # means Nerves derives the same device identifier every time
-      # (Nerves.Runtime.serial_number/0 hashes the MAC). NervesHub then
-      # rejects the second device for the new product as a duplicate
-      # identifier. Substituting a random locally-administered MAC per
-      # instance gives each QEMU device a unique identifier.
-      args: replace_mac(args, random_locally_administered_mac()),
+      # Two patches to the generated command line so parallel test modules
+      # don't collide:
+      #
+      # 1. The template MAC `fe:db:ed:de:d0:01` is identical across runs,
+      #    so `Nerves.Runtime.serial_number/0` hashes to the same device
+      #    identifier every time. NervesHub then rejects the second device
+      #    against a new product with a unique-constraint violation
+      #    (surfaced as a 401 on the websocket upgrade).
+      # 2. The template forwards host port 10022 to the guest's SSHD
+      #    (`hostfwd=tcp:127.0.0.1:10022-:22`). Only one process can bind
+      #    that port; we don't use the SSH access anyway, so drop the
+      #    hostfwd entirely.
+      args: args |> drop_hostfwd() |> replace_mac(random_locally_administered_mac()),
       env: env
     }
   end
@@ -302,6 +308,12 @@ defmodule TestNervesHub.QEMU do
   defp replace_mac(args, mac) do
     Enum.map(args, fn arg ->
       Regex.replace(~r/mac=[0-9a-fA-F:]{17}/, arg, "mac=#{mac}")
+    end)
+  end
+
+  defp drop_hostfwd(args) do
+    Enum.map(args, fn arg ->
+      Regex.replace(~r/,hostfwd=[^,\s]+/, arg, "")
     end)
   end
 

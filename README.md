@@ -210,8 +210,6 @@ surfaces (contexts via RPC, HTTP API via the CLI, hex / git installs of
 
 ## Caveats
 
-* Tests are not `async: true` — they share one `nerves_hub_web` instance and
-  the deployment orchestrator state.
 * The firmware update test currently times out on the device-side firmware
   install step; the publish + deployment-release path works, but the
   on-device swap needs more orchestrator investigation. See the TODO at the

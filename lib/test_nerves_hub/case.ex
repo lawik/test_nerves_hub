@@ -9,8 +9,10 @@ defmodule TestNervesHub.Case do
   Per test: boots a fresh QEMU running v1 of the firmware and exposes
   `TestNervesHub.QEMU.eval/3` via `context.device`.
 
-  Tests are NOT `async: true` — they share one nerves_hub_web instance
-  and we keep test orchestration single-threaded for now.
+  Modules run with `async: true`. Per-module isolation comes from
+  unique org / product / firmware-project names (slug + ms timestamp)
+  and a per-instance random QEMU MAC. The shared nerves_hub_web is
+  multi-tenant by org, so parallel modules don't trip over each other.
 
   Usage:
 
@@ -32,7 +34,7 @@ defmodule TestNervesHub.Case do
     auth = Keyword.get(opts, :auth, :shared_secret)
 
     quote do
-      use ExUnit.Case, async: false
+      use ExUnit.Case, async: true
 
       @tag :e2e
       @tnh_auth unquote(auth)
