@@ -28,21 +28,16 @@ Running services:
 
 A `docker-compose.yml` for both lives in the [nerves_hub_web repo].
 
-Igniter archive (one-time, machine-wide):
-
-```sh
-mix archive.install hex igniter_new
-```
-
-The first test run also installs and cross-compiles the `qemu_aarch64`
-Nerves system — that takes several minutes once, then cached in
-`~/.nerves/artifacts/`.
-
 ## Quickstart
 
 ```sh
 git clone https://github.com/<you>/test_nerves_hub.git
 cd test_nerves_hub
+# Install the igniter_new and nerves_bootstrap archives into the Elixir
+# install that the project's `.tool-versions` selects. Run them after
+# `cd` so any asdf-style version switch is already applied.
+mix archive.install hex igniter_new
+mix archive.install hex nerves_bootstrap
 mix deps.get
 mix test
 ```
