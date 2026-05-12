@@ -18,7 +18,6 @@ System tools (on `$PATH`):
 * `qemu-system-aarch64`
 * `fwup`
 * `git`
-* `psql` / `clickhouse-client` are not required at runtime
 
 Running services:
 
