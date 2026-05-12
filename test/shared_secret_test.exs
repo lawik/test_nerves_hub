@@ -3,7 +3,11 @@ defmodule TestNervesHub.SharedSecretTest do
 
   alias TestNervesHub.{QEMU, Org}
 
-  test "device connects with a shared secret", %{device: device, auth_payload: payload} do
+  test "device connects with a shared secret", %{
+    device: device,
+    auth_payload: payload,
+    fixtures: fixtures
+  } do
     assert is_binary(payload.product_key)
     assert is_binary(payload.product_secret)
 
@@ -83,7 +87,7 @@ defmodule TestNervesHub.SharedSecretTest do
       """)
     end
 
-    wait_until(fn -> Org.online?(identifier) end, 30_000)
+    wait_until(fn -> Org.online?(fixtures, identifier) end, 30_000)
   end
 
   defp wait_until(fun, timeout, on_timeout \\ :flunk) do

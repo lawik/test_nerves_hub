@@ -29,6 +29,27 @@ defmodule TestNervesHub.Signing do
   end
 
   @doc """
+  Generate a self-signed device certificate + private key for local-cert
+  auth tests. The CN is the device identifier and the cert is signed
+  with its own key — NervesHub's device cert endpoint stores it and
+  later matches incoming TLS handshakes by serial number.
+  """
+  @spec generate_device_cert(String.t()) :: {String.t(), String.t()}
+  def generate_device_cert(identifier) do
+    key = X509.PrivateKey.new_ec(:secp256r1)
+
+    cert =
+      X509.Certificate.self_signed(
+        key,
+        "/CN=#{identifier}",
+        template: :server,
+        validity: 365 * 10
+      )
+
+    {X509.Certificate.to_pem(cert), X509.PrivateKey.to_pem(key)}
+  end
+
+  @doc """
   Sign the firmware in-place using the given keypair.
 
   Passes the PEM contents directly via `--private-key`/`--public-key`

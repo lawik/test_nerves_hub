@@ -1,6 +1,7 @@
 defmodule TestNervesHub.FirmwareUpdateTest do
   use TestNervesHub.Case, auth: :shared_secret
 
+  alias NervesHubCLI.API
   alias TestNervesHub.{Deploy, Firmware, QEMU, Server}
 
   test "ships a new firmware to a connected device", ctx do
@@ -12,9 +13,9 @@ defmodule TestNervesHub.FirmwareUpdateTest do
 
     # Wait for the device to register/connect on the server side.
     {:ok, identifier} = QEMU.eval(ctx.device, "Nerves.Runtime.serial_number()")
-    wait_until(fn -> device_exists?(identifier) end, 60_000)
+    wait_until(fn -> device_exists?(ctx.fixtures, identifier) end, 60_000)
 
-    server_view_before = device_snapshot(identifier)
+    server_view_before = device_snapshot(ctx.fixtures, identifier)
     IO.puts("Device row after first connect:\n" <> inspect(server_view_before, pretty: true))
 
     # Manually attach the device to our deployment. NervesHub's auto-match
@@ -42,60 +43,44 @@ defmodule TestNervesHub.FirmwareUpdateTest do
       )
 
     if result != :ok do
-      server_view_after = device_snapshot(identifier)
+      server_view_after = device_snapshot(ctx.fixtures, identifier)
+      deps = deployments_snapshot(ctx.fixtures)
 
       flunk("""
       Device never picked up firmware 0.2.0.
       Server view of device:
       #{inspect(server_view_after, pretty: true, limit: :infinity)}
+      Deployments visible to the API:
+      #{inspect(deps, pretty: true, limit: :infinity)}
       """)
     end
   end
 
-  defp device_exists?(identifier) do
-    code = """
-    try do
-      NervesHub.Devices.get_by_identifier!(#{inspect(identifier)})
-      true
-    rescue
-      Ecto.NoResultsError -> false
-    end
-    """
+  # API-first: check device existence by GET'ing it from the device API.
+  defp device_exists?(fixtures, identifier) do
+    path = API.Device.path(fixtures.org.name, fixtures.product.name, identifier)
 
-    case Server.rpc(Code, :eval_string, [code]) do
-      {true, _} -> true
+    case API.request(:get, path, "", fixtures.auth) do
+      {:ok, %{"data" => %{}}} -> true
       _ -> false
     end
   end
 
-  defp device_snapshot(identifier) do
-    code = """
-    try do
-      d = NervesHub.Devices.get_by_identifier!(#{inspect(identifier)})
-      %{
-        id: d.id,
-        identifier: d.identifier,
-        tags: d.tags,
-        product_id: d.product_id,
-        deployment_id: d.deployment_id,
-        connection_status: case d.latest_connection do
-          %{status: s} -> s
-          _ -> nil
-        end,
-        firmware_uuid: d.firmware_metadata && d.firmware_metadata.uuid,
-        firmware_version: d.firmware_metadata && d.firmware_metadata.version
-      }
-    rescue
-      _ -> :not_found
-    end
-    """
+  # API-first device snapshot for diagnostics. The device JSON view
+  # already exposes everything we want (connection_status, firmware
+  # metadata, deployment_group), so we don't need RPC here.
+  defp device_snapshot(fixtures, identifier) do
+    path = API.Device.path(fixtures.org.name, fixtures.product.name, identifier)
 
-    case Server.rpc(Code, :eval_string, [code]) do
-      {result, _} -> result
-      other -> {:rpc_error, other}
+    case API.request(:get, path, "", fixtures.auth) do
+      {:ok, %{"data" => data}} -> data
+      other -> {:api_error, other}
     end
   end
 
+  # No HTTP API exposes "attach device to deployment", so this stays as
+  # an RPC bridge into NervesHub.Devices.update_deployment_group/2.
+  # Worth replacing once the API grows the operation.
   defp attach_device_to_deployment(identifier, deployment_name, fixtures) do
     code = """
     device = NervesHub.Devices.get_by_identifier!(#{inspect(identifier)})
@@ -118,34 +103,11 @@ defmodule TestNervesHub.FirmwareUpdateTest do
     end
   end
 
-  defp deployments_snapshot(product_id) do
-    code = """
-    NervesHub.ManagedDeployments.DeploymentGroup
-    |> NervesHub.Repo.all()
-    |> Enum.filter(fn d -> d.product_id == #{product_id} end)
-    |> Enum.map(fn d ->
-      %{id: d.id, name: d.name, platform: d.platform, architecture: d.architecture,
-        conditions: d.conditions, is_active: d.is_active,
-        current_deployment_release_id: d.current_deployment_release_id}
-    end)
-    """
-
-    case Server.rpc(Code, :eval_string, [code]) do
-      {result, _} -> result
-      other -> {:rpc_error, other}
-    end
-  end
-
-  defp matching_deployments_snapshot(identifier) do
-    code = """
-    device = NervesHub.Devices.get_by_identifier!(#{inspect(identifier)})
-    NervesHub.ManagedDeployments.matching_deployment_groups(device, [true])
-    |> Enum.map(fn d -> %{id: d.id, name: d.name, platform: d.platform} end)
-    """
-
-    case Server.rpc(Code, :eval_string, [code]) do
-      {result, _} -> result
-      other -> {:rpc_error, other}
+  # API-first deployments listing.
+  defp deployments_snapshot(fixtures) do
+    case API.Deployment.list(fixtures.org.name, fixtures.product.name, fixtures.auth) do
+      {:ok, %{"data" => data}} -> data
+      other -> {:api_error, other}
     end
   end
 

@@ -127,7 +127,7 @@ defmodule TestNervesHub.Case do
 
   defp build_firmware(slug, :local_cert, fixtures) do
     identifier = "tnh-#{slug}-device-#{:erlang.unique_integer([:positive])}"
-    {device, cert_pem, key_pem} = Org.create_device_with_cert(fixtures.product, identifier)
+    {device, cert_pem, key_pem} = Org.create_device_with_cert(fixtures, identifier)
 
     server = %{
       host: "10.0.2.2",
