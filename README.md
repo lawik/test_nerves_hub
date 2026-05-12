@@ -46,13 +46,12 @@ With no env vars, the runner will:
 
 1. Clone `nerves-hub/nerves_hub_web` from GitHub (main branch) into
    `work/nerves_hub_web/`.
-2. Run `mix deps.get` + `mix ecto.migrate` against it.
-3. Boot it with `mix phx.server` on ports 4900 (web) / 4901 (device).
-4. For each test module: generate a fresh firmware project under
+2. Start the NervesHub server on ports 4900 (web) / 4901 (device).
+3. For each test module: generate a fresh firmware project under
    `work/firmware/<slug>_<ts>/`, install the latest hex
    `nerves_hub_link`, build firmware, sign it, upload it, create a
    deployment.
-5. For each test: boot QEMU with a random per-instance MAC, attach the
+4. For each test: boot QEMU with a random per-instance MAC, attach the
    serial console to a Port, and run the test body.
 
 Expect the first run to take 5–15 minutes (clone + deps + Nerves system
@@ -60,62 +59,46 @@ Expect the first run to take 5–15 minutes (clone + deps + Nerves system
 
 ## Configuration
 
-All knobs are env vars — there's no project-level config to edit.
+All knobs are env vars. Database names default to `test_nerves_hub_e2e`
+so they don't collide with a developer's local `nerves_hub_dev` /
+`nerves_hub_test`.
 
-### nerves_hub_web source
+| Env var                              | Default                                              | Meaning |
+| ------------------------------------ | ---------------------------------------------------- | ------- |
+| `NERVES_HUB_WEB_SOURCE`              | `https://github.com/nerves-hub/nerves_hub_web.git`   | Local directory **or** git URL (https / ssh / `user@host:path`). |
+| `NERVES_HUB_WEB_REF`                 | `main`                                               | Branch / tag / commit, only relevant when the source is a git URL. |
+| `NERVES_HUB_LINK_PACKAGE`            | `nerves_hub_link`                                    | Package spec passed verbatim to `mix igniter.install`. |
+| `TEST_NERVES_HUB_DATABASE_URL`       | `postgres://postgres:postgres@localhost/postgres`    | Postgres connection (the database in the URL only has to exist; the runner creates the test DB itself). |
+| `TEST_NERVES_HUB_DATABASE`           | `test_nerves_hub_e2e`                                | Postgres database the test suite uses. |
+| `TEST_NERVES_HUB_CLICKHOUSE_URL`     | `http://default:@localhost:8123/`                    | ClickHouse HTTP endpoint. |
+| `TEST_NERVES_HUB_CLICKHOUSE_DATABASE`| `test_nerves_hub_e2e`                                | ClickHouse database the test suite uses. |
+| `TEST_NERVES_HUB_WEB_PORT`           | `4900`                                               | Web endpoint port. |
+| `TEST_NERVES_HUB_DEVICE_PORT`        | `4901`                                               | Device endpoint port (usually `web_port + 1`). |
+| `TEST_NERVES_HUB_WORK_DIR`           | `<repo>/work`                                        | Where clones, firmware projects, and logs live. |
 
-| Env var                  | Default                                            | Meaning |
-| ------------------------ | -------------------------------------------------- | ------- |
-| `NERVES_HUB_WEB_SOURCE`  | `https://github.com/nerves-hub/nerves_hub_web.git` | Local directory **or** git URL (https / ssh / `user@host:path`). |
-| `NERVES_HUB_WEB_REF`     | `main`                                             | Branch / tag / commit, only relevant when source is a git URL. |
+### Examples
 
 ```sh
-# Point at a local checkout (no clone)
+# Point web at a local checkout (no clone)
 NERVES_HUB_WEB_SOURCE=../nerves_hub_web mix test
 
-# Point at a feature branch on a fork
+# Point web at a feature branch on a fork
 NERVES_HUB_WEB_SOURCE=git@github.com:yourname/nerves_hub_web.git \
   NERVES_HUB_WEB_REF=fix-the-thing \
   mix test
-```
 
-### nerves_hub_link install spec
-
-`NERVES_HUB_LINK_PACKAGE` is passed verbatim to `mix igniter.install`, so it
-accepts every shape igniter understands:
-
-```sh
-# Default: latest from hex
-mix test
-
-# Pin a hex version
+# Pin nerves_hub_link to a specific hex version
 NERVES_HUB_LINK_PACKAGE='nerves_hub_link@2.10.0' mix test
 
-# Local path checkout
+# Local path checkout of nerves_hub_link
 NERVES_HUB_LINK_PACKAGE='nerves_hub_link@path:/abs/path/to/nerves_hub_link' mix test
 
-# GitHub branch
+# GitHub branch of nerves_hub_link
 NERVES_HUB_LINK_PACKAGE='nerves_hub_link@github:nerves-hub/nerves_hub_link@main' mix test
 
-# Arbitrary git URL + ref
+# Arbitrary git URL + ref for nerves_hub_link
 NERVES_HUB_LINK_PACKAGE='nerves_hub_link@git:https://github.com/forked/nerves_hub_link@some-branch' mix test
 ```
-
-### Databases and ports
-
-| Env var                              | Default                                              |
-| ------------------------------------ | ---------------------------------------------------- |
-| `TEST_NERVES_HUB_DATABASE_URL`       | `postgres://postgres:postgres@localhost/postgres`    |
-| `TEST_NERVES_HUB_DATABASE`           | `test_nerves_hub_e2e`                                |
-| `TEST_NERVES_HUB_CLICKHOUSE_URL`     | `http://default:@localhost:8123/`                    |
-| `TEST_NERVES_HUB_CLICKHOUSE_DATABASE`| `test_nerves_hub_e2e`                                |
-| `TEST_NERVES_HUB_WEB_PORT`           | `4900` (device endpoint binds to `WEB_PORT + 1`)     |
-| `TEST_NERVES_HUB_DEVICE_PORT`        | `4901`                                               |
-| `TEST_NERVES_HUB_WORK_DIR`           | `<repo>/work`                                        |
-| `MIX_TARGET` (build target)          | `qemu_aarch64`                                       |
-
-Database names default to `test_nerves_hub_e2e` so they don't collide with a
-developer's local `nerves_hub_dev` / `nerves_hub_test`.
 
 ## Writing a test
 
