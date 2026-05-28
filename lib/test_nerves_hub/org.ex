@@ -34,7 +34,8 @@ defmodule TestNervesHub.Org do
           product: map(),
           api_token: String.t(),
           auth: struct(),
-          org_key: %{name: String.t(), public_key: String.t(), private_key: String.t()}
+          org_key: %{name: String.t(), public_key: String.t(), private_key: String.t()},
+          ca: %{cert_pem: String.t(), key_pem: String.t()}
         }
 
   @doc """
@@ -76,6 +77,12 @@ defmodule TestNervesHub.Org do
 
     {:ok, _} = API.Key.create(org.name, key_name, String.trim(pub_pem), auth)
 
+    # Org-level CA. Device certs for this org are signed by this CA, and
+    # the CA is registered with nerves_hub_web so `NervesHub.SSL.verify_fun`
+    # can validate incoming device handshakes against a known signer.
+    ca = Signing.generate_ca("tnh-#{slug}-ca-#{unique}")
+    {:ok, _} = API.CACertificate.create(org.name, ca.cert_pem, auth, "tnh #{slug} ca")
+
     {:ok, %{"data" => _product_data}} =
       API.Product.create(org.name, product_name, auth)
 
@@ -102,7 +109,8 @@ defmodule TestNervesHub.Org do
       product: product,
       api_token: auth.token,
       auth: auth,
-      org_key: %{name: key_name, public_key: pub_pem, private_key: priv_pem}
+      org_key: %{name: key_name, public_key: pub_pem, private_key: priv_pem},
+      ca: ca
     }
   end
 
@@ -126,7 +134,11 @@ defmodule TestNervesHub.Org do
   @spec create_device_with_cert(fixtures(), String.t()) ::
           {map(), String.t(), String.t()}
   def create_device_with_cert(fixtures, identifier) do
-    {cert_pem, key_pem} = Signing.generate_device_cert(identifier)
+    # Sign the device cert with the org CA registered in setup_module/1.
+    # `NervesHub.SSL.verify_fun` walks the cert presented over TLS, finds
+    # the issuer CA's SKI in the DB, and either accepts the leaf via its
+    # stored fingerprint or registers it on the fly.
+    {cert_pem, key_pem} = Signing.generate_device_cert(identifier, fixtures.ca)
 
     {:ok, %{"data" => device_data}} =
       API.Device.create(

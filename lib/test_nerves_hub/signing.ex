@@ -29,24 +29,51 @@ defmodule TestNervesHub.Signing do
   end
 
   @doc """
-  Generate a self-signed device certificate + private key for local-cert
-  auth tests. The CN is the device identifier and the cert is signed
-  with its own key — NervesHub's device cert endpoint stores it and
-  later matches incoming TLS handshakes by serial number.
+  Generate a self-signed CA (root) certificate + key for an org. Caller is
+  expected to register the CA cert against the org via
+  `NervesHubCLI.API.CACertificate.create/4`; subsequently issued device
+  certs (see `generate_device_cert/3`) will chain to it and pass server-
+  side TLS verification via `NervesHub.SSL.verify_fun`.
   """
-  @spec generate_device_cert(String.t()) :: {String.t(), String.t()}
-  def generate_device_cert(identifier) do
+  @spec generate_ca(String.t()) :: %{cert_pem: String.t(), key_pem: String.t()}
+  def generate_ca(common_name) do
     key = X509.PrivateKey.new_ec(:secp256r1)
 
     cert =
       X509.Certificate.self_signed(
         key,
+        "/CN=#{common_name}",
+        template: :root_ca,
+        validity: 365 * 10
+      )
+
+    %{cert_pem: X509.Certificate.to_pem(cert), key_pem: X509.PrivateKey.to_pem(key)}
+  end
+
+  @doc """
+  Generate a device certificate + private key signed by the given CA. The
+  CN is the device identifier — `NervesHub.SSL.verify_fun` uses CN to
+  match the device row during JITP/registration.
+  """
+  @spec generate_device_cert(String.t(), %{cert_pem: String.t(), key_pem: String.t()}) ::
+          {String.t(), String.t()}
+  def generate_device_cert(identifier, %{cert_pem: ca_cert_pem, key_pem: ca_key_pem}) do
+    ca_cert = X509.Certificate.from_pem!(ca_cert_pem)
+    ca_key = X509.PrivateKey.from_pem!(ca_key_pem)
+
+    device_key = X509.PrivateKey.new_ec(:secp256r1)
+
+    cert =
+      X509.Certificate.new(
+        X509.PublicKey.derive(device_key),
         "/CN=#{identifier}",
+        ca_cert,
+        ca_key,
         template: :server,
         validity: 365 * 10
       )
 
-    {X509.Certificate.to_pem(cert), X509.PrivateKey.to_pem(key)}
+    {X509.Certificate.to_pem(cert), X509.PrivateKey.to_pem(device_key)}
   end
 
   @doc """
