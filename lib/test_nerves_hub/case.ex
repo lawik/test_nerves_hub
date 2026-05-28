@@ -109,7 +109,7 @@ defmodule TestNervesHub.Case do
     {key, secret} = Org.create_shared_secret_auth(fixtures.product)
 
     server = %{
-      host: "10.0.2.2",
+      host: Server.host_address(),
       device_port: Config.device_port(),
       ca_pem: Server.ca_pem()
     }
@@ -130,7 +130,7 @@ defmodule TestNervesHub.Case do
     {device, cert_pem, key_pem} = Org.create_device_with_cert(fixtures, identifier)
 
     server = %{
-      host: "10.0.2.2",
+      host: Server.host_address(),
       device_port: Config.device_port(),
       ca_pem: Server.ca_pem()
     }

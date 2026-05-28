@@ -63,6 +63,86 @@ defmodule TestNervesHub.Server do
     File.read!(path)
   end
 
+  @doc """
+  IPv4 address to advertise as `WEB_HOST` to the spawned `nerves_hub_web`
+  and to bake into device firmware as the server host.
+
+  We need an address that is reachable from BOTH directions:
+    * The QEMU guest dials it (firmware download + websocket).
+    * nerves_hub_web's own delta builder fetches firmware from its own
+      public URL, so the server has to be able to reach itself at the
+      same address.
+
+  `10.0.2.2` (QEMU's host-from-guest alias) is only routable from the
+  guest, not from the host. `127.0.0.1` is only the host's loopback, not
+  reachable from the guest. The host's primary LAN IPv4 satisfies both:
+  the guest's NAT routes through the host's stack, and the host
+  recognises the address as its own and short-circuits to loopback.
+
+  `WEB_HOST_OVERRIDE` forces a specific address — handy if the
+  autodetected interface is on a VPN, or for CI where the routing
+  topology is known up front.
+  """
+  @spec host_address() :: String.t()
+  def host_address do
+    case System.get_env("WEB_HOST_OVERRIDE") do
+      override when is_binary(override) and override != "" ->
+        override
+
+      _ ->
+        detect_host_address!()
+    end
+  end
+
+  defp detect_host_address! do
+    case :inet.getifaddrs() do
+      {:ok, ifs} ->
+        ifs
+        |> Enum.flat_map(&interface_ipv4s/1)
+        |> Enum.find(&routable_ipv4?/1)
+        |> case do
+          {a, b, c, d} -> "#{a}.#{b}.#{c}.#{d}"
+          nil -> raise_no_host_address()
+        end
+
+      {:error, reason} ->
+        raise "Failed to enumerate network interfaces: #{inspect(reason)}"
+    end
+  end
+
+  defp interface_ipv4s({_name, opts}) do
+    # Only consider up + running interfaces; skip the loopback flag explicitly
+    # so we don't pick lo0 even if it has a non-127 alias.
+    flags = Keyword.get(opts, :flags, [])
+
+    if :up in flags and :running in flags and :loopback not in flags do
+      for {:addr, {_, _, _, _} = ip4} <- opts, do: ip4
+    else
+      []
+    end
+  end
+
+  defp routable_ipv4?({127, _, _, _}), do: false
+  defp routable_ipv4?({169, 254, _, _}), do: false
+  defp routable_ipv4?({_, _, _, _}), do: true
+  defp routable_ipv4?(_), do: false
+
+  defp raise_no_host_address do
+    raise """
+    Could not autodetect a non-loopback IPv4 address for nerves_hub_web to
+    advertise. Both the QEMU device and the server (for delta generation)
+    need to reach the same URL.
+
+    Set WEB_HOST_OVERRIDE to a routable address before running tests, for
+    example:
+
+        WEB_HOST_OVERRIDE=192.168.1.42 mix test
+
+    A LAN IP works; 127.0.0.1 will not (the QEMU guest can't reach the
+    host's loopback).
+    """
+  end
+
   # --- GenServer ---
 
   @impl true
@@ -190,10 +270,12 @@ defmodule TestNervesHub.Server do
       {"WEB_PORT", to_string(web_port)},
       # device endpoint is web_port + 1 by default in the dev config
       {"DEVICE_PORT", to_string(device_port)},
-      # Firmware download URLs are built from WEB_HOST. The QEMU device
-      # reaches the host via 10.0.2.2 (user-mode networking), not
-      # "localhost" — that would point at the guest's own loopback.
-      {"WEB_HOST", "10.0.2.2"},
+      # Firmware download URLs are built from WEB_HOST. We use the host's
+      # primary LAN IPv4 so the same address resolves correctly from both
+      # the QEMU guest (via SLIRP NAT) and the server itself (own-address
+      # short-circuit to loopback) — required for the delta builder to
+      # fetch the firmware files it advertises.
+      {"WEB_HOST", host_address()},
       {"MIX_ENV", "dev"},
       {"ERL_AFLAGS", "-name #{node} -setcookie #{cookie}"}
     ]
