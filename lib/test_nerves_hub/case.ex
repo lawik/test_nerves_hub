@@ -126,7 +126,13 @@ defmodule TestNervesHub.Case do
   end
 
   defp build_firmware(slug, :local_cert, fixtures) do
-    identifier = "tnh-#{slug}-device-#{:erlang.unique_integer([:positive])}"
+    # Random hex suffix — `:erlang.unique_integer/1` resets across BEAM
+    # instances and a wall-clock millisecond can also collide on a fast
+    # rerun, both of which trip the device identifier's unique constraint.
+    # 64 bits of entropy is overkill but free.
+    identifier =
+      "tnh-#{slug}-device-#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"
+
     {device, cert_pem, key_pem} = Org.create_device_with_cert(fixtures, identifier)
 
     server = %{
