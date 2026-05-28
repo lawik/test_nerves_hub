@@ -11,11 +11,9 @@ defmodule TestNervesHub.SharedSecretTest do
     assert is_binary(payload.product_key)
     assert is_binary(payload.product_secret)
 
-    assert {:ok, true} =
-             QEMU.eval(
-               device,
-               "Application.started_applications() |> Enum.any?(fn {a, _, _} -> a == :nerves_hub_link end)"
-             )
+    # IEx prompt fires before user apps finish starting, so poll instead
+    # of asserting once.
+    wait_until(fn -> nerves_hub_link_started?(device) end, 30_000)
 
     # Pull the device's identifier from the running firmware, then poll
     # both ends — the device's NervesHubLink and the server's record.
@@ -88,6 +86,16 @@ defmodule TestNervesHub.SharedSecretTest do
     end
 
     wait_until(fn -> Org.online?(fixtures, identifier) end, 30_000)
+  end
+
+  defp nerves_hub_link_started?(device) do
+    case QEMU.eval(
+           device,
+           "Application.started_applications() |> Enum.any?(fn {a, _, _} -> a == :nerves_hub_link end)"
+         ) do
+      {:ok, true} -> true
+      _ -> false
+    end
   end
 
   defp wait_until(fun, timeout, on_timeout \\ :flunk) do

@@ -5,11 +5,9 @@ defmodule TestNervesHub.FirmwareUpdateTest do
   alias TestNervesHub.{Deploy, Firmware, QEMU, Server}
 
   test "ships a new firmware to a connected device", ctx do
-    assert {:ok, true} =
-             QEMU.eval(
-               ctx.device,
-               "Application.started_applications() |> Enum.any?(fn {a, _, _} -> a == :nerves_hub_link end)"
-             )
+    # IEx prompt fires before user apps finish starting, so poll instead
+    # of asserting once.
+    wait_until(fn -> nerves_hub_link_started?(ctx.device) end, 30_000)
 
     # Wait for the device to register/connect on the server side.
     {:ok, identifier} = QEMU.eval(ctx.device, "Nerves.Runtime.serial_number()")
@@ -33,8 +31,14 @@ defmodule TestNervesHub.FirmwareUpdateTest do
     result =
       wait_until(
         fn ->
-          case QEMU.eval(ctx.device, "Nerves.Runtime.KV.get(\"nerves_fw_version\")") do
-            {:ok, "0.2.0"} -> true
+          # Poll the server's view of the device rather than RPC-ing into
+          # the guest. The device is mid-fwup-then-reboot in this window;
+          # QEMU.eval times out (or its buffer gets garbled by reboot
+          # output) more often than not. The server sees the new firmware
+          # version via the device's reconnect heartbeat, which is what
+          # we actually want to assert anyway.
+          case device_snapshot(ctx.fixtures, identifier) do
+            %{"firmware_metadata" => %{"version" => "0.2.0"}} -> true
             _ -> false
           end
         end,
@@ -113,20 +117,30 @@ defmodule TestNervesHub.FirmwareUpdateTest do
 
   # Bumping the project's mix.exs version in place is the lightest way
   # to produce a "new" firmware that nerves_hub_web will treat as a
-  # distinct release. The version lives in the project/0 function.
+  # distinct release. Nerves-style projects pull the version from a
+  # `@version "..."` module attribute (`version: @version` in project/0),
+  # so that's the line we have to rewrite.
   defp bump_firmware_version(project_path, version) do
     mix_exs = Path.join(project_path, "mix.exs")
     contents = File.read!(mix_exs)
+    pattern = ~r/@version\s+"[^"]+"/
 
-    updated =
-      Regex.replace(
-        ~r/version:\s*"[^"]+"/,
-        contents,
-        ~s|version: "#{version}"|,
-        global: false
-      )
+    unless Regex.match?(pattern, contents) do
+      raise "bump_firmware_version: no `@version \"...\"` line found in #{mix_exs}"
+    end
 
+    updated = Regex.replace(pattern, contents, ~s|@version "#{version}"|, global: false)
     File.write!(mix_exs, updated)
+  end
+
+  defp nerves_hub_link_started?(device) do
+    case QEMU.eval(
+           device,
+           "Application.started_applications() |> Enum.any?(fn {a, _, _} -> a == :nerves_hub_link end)"
+         ) do
+      {:ok, true} -> true
+      _ -> false
+    end
   end
 
   defp wait_until(fun, timeout, on_timeout \\ :flunk) do
