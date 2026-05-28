@@ -64,10 +64,12 @@ defmodule TestNervesHub.FirmwareProject do
         "--yes"
       ]
 
-      case run("mix", args, cd: Path.dirname(path)) do
-        {_out, 0} -> :ok
-        {out, code} -> {:error, {:igniter_new_failed, code, out}}
-      end
+      with_hex_lock(fn ->
+        case run("mix", args, cd: Path.dirname(path)) do
+          {_out, 0} -> :ok
+          {out, code} -> {:error, {:igniter_new_failed, code, out}}
+        end
+      end)
     end
   end
 
@@ -78,10 +80,22 @@ defmodule TestNervesHub.FirmwareProject do
     # default hex install becomes the bare `nerves_hub_link` spec.
     package = Config.nerves_hub_link_package()
 
-    case run("mix", ["igniter.install", package, "--yes", "--yes-to-deps"], cd: path) do
-      {_out, 0} -> :ok
-      {out, code} -> {:error, {:igniter_install_failed, code, out}}
-    end
+    with_hex_lock(fn ->
+      case run("mix", ["igniter.install", package, "--yes", "--yes-to-deps"], cd: path) do
+        {_out, 0} -> :ok
+        {out, code} -> {:error, {:igniter_install_failed, code, out}}
+      end
+    end)
+  end
+
+  # Hex's registry cache (`~/.hex/cache.ets`) is global. Multiple async test
+  # modules running `mix deps.get` / `mix igniter.install` in parallel race
+  # on the cache's atomic-rename and one of them crashes with `:eaccess`.
+  # We serialize every hex-touching subprocess across the BEAM to keep the
+  # cache happy. The build itself can still run concurrently in QEMU.
+  @doc false
+  def with_hex_lock(fun) do
+    :global.trans({:tnh_hex_lock, self()}, fun, [Node.self()], :infinity)
   end
 
   defp write_auth_files(_path, _auth), do: :ok
@@ -127,7 +141,7 @@ defmodule TestNervesHub.FirmwareProject do
     cacerts_literal = ca_pem_to_cacerts_literal(server.ca_pem)
 
     """
-    __tnh_cacerts = #{cacerts_literal}
+    tnh_cacerts = #{cacerts_literal}
 
     config :nerves_hub_link,
       configurator: NervesHubLink.Configurator.SharedSecret,
@@ -137,7 +151,7 @@ defmodule TestNervesHub.FirmwareProject do
         product_secret: #{inspect(secret)}
       ],
       ssl: [
-        cacerts: __tnh_cacerts,
+        cacerts: tnh_cacerts,
         verify: :verify_peer,
         server_name_indication: ~c"#{@server_cert_hostname}"
       ]
@@ -150,16 +164,17 @@ defmodule TestNervesHub.FirmwareProject do
     key_der_literal = key_pem_to_der_literal(key_pem)
 
     """
-    __tnh_cacerts = #{cacerts_literal}
-    __tnh_cert = #{cert_der_literal}
-    __tnh_key = #{key_der_literal}
+    tnh_cacerts = #{cacerts_literal}
+    tnh_cert = #{cert_der_literal}
+    tnh_key = #{key_der_literal}
 
     config :nerves_hub_link,
+      configurator: NervesHubLink.Configurator.LocalCertKey,
       host: "wss://#{server.host}:#{server.device_port}",
       ssl: [
-        cacerts: __tnh_cacerts,
-        cert: __tnh_cert,
-        key: __tnh_key,
+        cacerts: tnh_cacerts,
+        cert: tnh_cert,
+        key: tnh_key,
         verify: :verify_peer,
         server_name_indication: ~c"#{@server_cert_hostname}"
       ]
@@ -188,6 +203,24 @@ defmodule TestNervesHub.FirmwareProject do
   end
 
   defp run(cmd, args, opts) do
-    System.cmd(cmd, args, [stderr_to_stdout: true] ++ opts)
+    {out, code} = System.cmd(cmd, args, [stderr_to_stdout: true] ++ opts)
+    {scrub(out), code}
   end
+
+  # Igniter's spinner emits ~20 frames/second of "\r\e[K<task> <char>" while
+  # subtasks run. In a TTY each frame overwrites the last; under System.cmd
+  # they all land in the captured buffer and drown the real error. Replay the
+  # carriage returns to keep only the last segment of each line, then strip
+  # ANSI sequences so the result is human-readable.
+  defp scrub(out) do
+    out
+    |> String.split("\n")
+    |> Enum.map(fn line ->
+      line |> String.split("\r") |> List.last() |> strip_ansi()
+    end)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("\n")
+  end
+
+  defp strip_ansi(str), do: Regex.replace(~r/\e\[[\d;]*[a-zA-Z]/, str, "")
 end

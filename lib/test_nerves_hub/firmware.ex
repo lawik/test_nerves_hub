@@ -15,14 +15,18 @@ defmodule TestNervesHub.Firmware do
     target = opts[:target] || Config.qemu_target()
     env = [{"MIX_TARGET", target}, {"MIX_ENV", "dev"}]
 
-    with {_, 0} <- run("mix", ["deps.get"], project_path, env),
-         {_, 0} <- run("mix", ["firmware"], project_path, env),
-         {:ok, fw} <- locate_firmware(project_path, target) do
-      {:ok, fw}
-    else
-      {out, code} when is_binary(out) -> {:error, {:build_failed, code, out}}
-      {:error, _} = err -> err
-    end
+    # Hex cache is global; serialize anything that may write to it.
+    # See FirmwareProject.with_hex_lock/1.
+    TestNervesHub.FirmwareProject.with_hex_lock(fn ->
+      with {_, 0} <- run("mix", ["deps.get"], project_path, env),
+           {_, 0} <- run("mix", ["firmware"], project_path, env),
+           {:ok, fw} <- locate_firmware(project_path, target) do
+        {:ok, fw}
+      else
+        {out, code} when is_binary(out) -> {:error, {:build_failed, code, out}}
+        {:error, _} = err -> err
+      end
+    end)
   end
 
   defp locate_firmware(project_path, target) do
