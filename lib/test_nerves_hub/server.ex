@@ -69,17 +69,30 @@ defmodule TestNervesHub.Server do
   def init(_opts) do
     Process.flag(:trap_exit, true)
 
+    Logger.info("nerves_hub_web: bootstrapping test server")
+
     pg = Config.postgres()
     ch = Config.clickhouse()
 
+    Logger.info("nerves_hub_web: ensuring postgres database #{inspect(pg[:database])}")
     :ok = ensure_postgres_database!(pg)
+
+    Logger.info("nerves_hub_web: ensuring clickhouse database #{inspect(ch[:database])}")
     :ok = ensure_clickhouse_database!(ch)
+
+    Logger.info("nerves_hub_web: preparing checkout (mix deps.get)")
     :ok = prepare_web_project!()
+
+    Logger.info("nerves_hub_web: running migrations (mix ecto.migrate)")
     :ok = run_migrations!(pg, ch)
 
     suffix = :erlang.unique_integer([:positive])
     cookie = "test_nerves_hub_#{suffix}"
     node = :"nerves_hub_#{suffix}@127.0.0.1"
+
+    Logger.info(
+      "nerves_hub_web: starting mix phx.server (node #{node}, web :#{Config.web_port()}, device :#{Config.device_port()})"
+    )
 
     port = start_phoenix(pg, ch, node, cookie)
 
@@ -102,10 +115,20 @@ defmodule TestNervesHub.Server do
   end
 
   def handle_call(:await_ready, _from, state) do
+    Logger.info("nerves_hub_web: waiting for HTTP endpoint on :#{state.web_port}")
+
     result =
-      with :ok <- poll_http(state.web_port, @startup_timeout),
-           :ok <- poll_node(state.node, state.cookie, @startup_timeout) do
-        :ok
+      with :ok <- poll_http(state.web_port, @startup_timeout) do
+        Logger.info("nerves_hub_web: HTTP up; waiting for RPC node #{state.node}")
+
+        case poll_node(state.node, state.cookie, @startup_timeout) do
+          :ok ->
+            Logger.info("nerves_hub_web: ready (HTTP + RPC) — node=#{state.node}")
+            :ok
+
+          other ->
+            other
+        end
       end
 
     {:reply, result, %{state | ready?: result == :ok}}
@@ -167,23 +190,50 @@ defmodule TestNervesHub.Server do
       {"WEB_PORT", to_string(web_port)},
       # device endpoint is web_port + 1 by default in the dev config
       {"DEVICE_PORT", to_string(device_port)},
+      # Firmware download URLs are built from WEB_HOST. The QEMU device
+      # reaches the host via 10.0.2.2 (user-mode networking), not
+      # "localhost" — that would point at the guest's own loopback.
+      {"WEB_HOST", "10.0.2.2"},
       {"MIX_ENV", "dev"},
       {"ERL_AFLAGS", "-name #{node} -setcookie #{cookie}"}
     ]
 
-    Port.open({:spawn_executable, System.find_executable("mix")}, [
+    mix = System.find_executable("mix") || raise "mix not found on PATH"
+
+    Port.open({:spawn_executable, "/bin/sh"}, [
       :binary,
       :exit_status,
       :stderr_to_stdout,
-      {:args, ["phx.server"]},
+      {:args, ["-c", phoenix_wrapper(mix)]},
       {:env, Enum.map(env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)},
       {:cd, String.to_charlist(web_path)}
     ])
   end
 
+  # Wrap `mix phx.server` so the child dies with us. When the BEAM exits
+  # (including hard exits like a MatchError in test_helper.exs that bypass
+  # GenServer.terminate/2), the Port's stdin closes, `read` returns EOF, and
+  # the wrapper kills mix. Also forwards SIGTERM from terminate/2 to mix
+  # via the trap. Result: no more orphaned phx.server holding port 4900.
+  defp phoenix_wrapper(mix) do
+    """
+    #{mix} phx.server &
+    CHILD=$!
+    trap 'kill -TERM $CHILD 2>/dev/null' TERM INT
+    # Block until stdin closes (Port closes when BEAM exits) or a signal arrives.
+    while IFS= read -r _; do :; done
+    kill -TERM $CHILD 2>/dev/null
+    wait $CHILD 2>/dev/null
+    """
+  end
+
+  # A "still waiting" log every ~5s — frequent enough that a hung startup
+  # tells you which gate it's stuck on, rare enough not to spam.
+  @poll_log_interval_ms 5_000
+
   defp poll_http(port, timeout) do
     deadline = System.monotonic_time(:millisecond) + timeout
-    do_poll_http(port, deadline)
+    do_poll_http(port, deadline, System.monotonic_time(:millisecond))
   end
 
   # Verifies we can reach the RPC node AND that NervesHub.Accounts is loaded.
@@ -192,35 +242,69 @@ defmodule TestNervesHub.Server do
   defp poll_node(node, cookie, timeout) do
     deadline = System.monotonic_time(:millisecond) + timeout
     _ = Node.set_cookie(node, cookie)
-    do_poll_node(node, deadline)
+    do_poll_node(node, deadline, System.monotonic_time(:millisecond))
   end
 
-  defp do_poll_node(node, deadline) do
-    with true <- Node.connect(node),
-         {:module, _} <- :erpc.call(node, Code, :ensure_loaded, [NervesHub.Accounts], 5_000) do
-      :ok
-    else
-      _ ->
-        if System.monotonic_time(:millisecond) > deadline do
-          {:error, :rpc_not_ready}
-        else
-          Process.sleep(500)
-          do_poll_node(node, deadline)
-        end
+  defp do_poll_node(node, deadline, last_log) do
+    {ok?, reason} =
+      case Node.connect(node) do
+        true ->
+          case :erpc.call(node, Code, :ensure_loaded, [NervesHub.Accounts], 5_000) do
+            {:module, _} -> {true, nil}
+            other -> {false, {:module_not_loaded, other}}
+          end
+
+        other ->
+          {false, {:node_connect, other}}
+      end
+
+    cond do
+      ok? ->
+        :ok
+
+      System.monotonic_time(:millisecond) > deadline ->
+        {:error, {:rpc_not_ready, reason}}
+
+      true ->
+        now = System.monotonic_time(:millisecond)
+
+        last_log =
+          if now - last_log >= @poll_log_interval_ms do
+            Logger.info(
+              "nerves_hub_web: still waiting for RPC node #{node} (last: #{inspect(reason)})"
+            )
+
+            now
+          else
+            last_log
+          end
+
+        Process.sleep(500)
+        do_poll_node(node, deadline, last_log)
     end
   end
 
-  defp do_poll_http(port, deadline) do
+  defp do_poll_http(port, deadline, last_log) do
     case Req.get("http://localhost:#{port}/", retry: false, receive_timeout: 1_000) do
       {:ok, %{status: status}} when status < 500 ->
         :ok
 
-      _ ->
+      reason ->
         if System.monotonic_time(:millisecond) > deadline do
-          {:error, :timeout}
+          {:error, {:http_timeout, reason}}
         else
+          now = System.monotonic_time(:millisecond)
+
+          last_log =
+            if now - last_log >= @poll_log_interval_ms do
+              Logger.info("nerves_hub_web: still waiting for HTTP on :#{port}")
+              now
+            else
+              last_log
+            end
+
           Process.sleep(500)
-          do_poll_http(port, deadline)
+          do_poll_http(port, deadline, last_log)
         end
     end
   end
