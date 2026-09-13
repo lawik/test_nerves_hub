@@ -139,7 +139,13 @@ defmodule TestNervesHub.QEMU do
   def terminate(_reason, %State{port: port}) when is_port(port) do
     case Port.info(port, :os_pid) do
       {:os_pid, os_pid} ->
-        System.cmd("kill", ["-TERM", to_string(os_pid)], stderr_to_stdout: true)
+        # QEMU quits on SIGTERM, but a guest mid-reboot has been seen to
+        # outlive the runner; give it a moment, then insist.
+        _ = System.cmd("kill", ["-TERM", to_string(os_pid)], stderr_to_stdout: true)
+
+        unless wait_for_exit(os_pid, 3_000) do
+          _ = System.cmd("kill", ["-KILL", to_string(os_pid)], stderr_to_stdout: true)
+        end
 
       _ ->
         :ok
@@ -152,6 +158,24 @@ defmodule TestNervesHub.QEMU do
   def terminate(_reason, _state), do: :ok
 
   # --- internals ---
+
+  defp wait_for_exit(os_pid, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_wait_for_exit(os_pid, deadline)
+  end
+
+  defp do_wait_for_exit(os_pid, deadline) do
+    cond do
+      match?({_, 1}, System.cmd("kill", ["-0", to_string(os_pid)], stderr_to_stdout: true)) ->
+        true
+
+      System.monotonic_time(:millisecond) > deadline ->
+        false
+
+      true ->
+        Process.sleep(100) && do_wait_for_exit(os_pid, deadline)
+    end
+  end
 
   # The "ready" signal is the first IEx prompt we see in the buffer.
   # Matches both `iex(1)>` (default Nerves boot, not distributed) and the
