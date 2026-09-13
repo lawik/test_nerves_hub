@@ -108,10 +108,11 @@ defmodule TestNervesHub.Load.Cluster do
     name = :"tnh_load_device_node_#{i}"
     web_port = Config.web_port() + @port_stride * i
 
-    env = [
-      {"FEATURES_HEALTH_INTERVAL_MINUTES", to_string(scenario.health_interval_minutes)},
-      {"FEATURES_GEO_INTERVAL_MINUTES", "0"}
-    ]
+    env =
+      [
+        {"FEATURES_HEALTH_INTERVAL_MINUTES", to_string(scenario.health_interval_minutes)},
+        {"FEATURES_GEO_INTERVAL_MINUTES", "0"}
+      ] ++ scenario.node_env
 
     {:ok, _} =
       Server.start_link(

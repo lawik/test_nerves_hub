@@ -22,6 +22,7 @@ defmodule TestNervesHub.Load.Scenario do
   | `health_interval_minutes` | `LOAD_HEALTH_MINUTES`   | 1       | how often device nodes ask for health reports (`FEATURES_HEALTH_INTERVAL_MINUTES`) |
   | `payload_bytes`        | `LOAD_PAYLOAD_BYTES`       | 262144  | size of the fake firmware's payload |
   | `label`                | `LOAD_LABEL`               |         | free text carried into the report (a branch name, say) |
+  | `node_env`             | `LOAD_NODE_ENV`            |         | extra environment for the device-role nodes, `KEY=value,KEY=value` — e.g. `DEVICE_WEBSOCKET_COMPRESSION=false` or `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2,MALLOC_CONF=...` |
   """
 
   @type t :: %__MODULE__{}
@@ -39,7 +40,8 @@ defmodule TestNervesHub.Load.Scenario do
             compress: true,
             health_interval_minutes: 1,
             payload_bytes: 262_144,
-            label: nil
+            label: nil,
+            node_env: []
 
   @doc "A scenario from `LOAD_*` environment variables over the defaults."
   @spec from_env(keyword()) :: t()
@@ -58,9 +60,23 @@ defmodule TestNervesHub.Load.Scenario do
       compress: System.get_env("LOAD_COMPRESS", "true") == "true",
       health_interval_minutes: int("LOAD_HEALTH_MINUTES", 1),
       payload_bytes: int("LOAD_PAYLOAD_BYTES", 262_144),
-      label: System.get_env("LOAD_LABEL")
+      label: System.get_env("LOAD_LABEL"),
+      node_env: node_env(System.get_env("LOAD_NODE_ENV", ""))
     }
     |> struct!(overrides)
+  end
+
+  # `MALLOC_CONF` values contain colons and commas of their own, so pairs
+  # are split on commas only where a `KEY=` follows.
+  defp node_env(""), do: []
+
+  defp node_env(spec) do
+    ~r/,(?=[A-Z_][A-Z0-9_]*=)/
+    |> Regex.split(spec)
+    |> Enum.map(fn pair ->
+      [key, value] = String.split(pair, "=", parts: 2)
+      {key, value}
+    end)
   end
 
   defp int(var, default) do
