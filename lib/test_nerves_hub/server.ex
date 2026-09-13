@@ -1,6 +1,6 @@
 defmodule TestNervesHub.Server do
   @moduledoc """
-  Manages a `nerves_hub_web` instance for the test suite.
+  Manages one `nerves_hub_web` node for the test suite.
 
   Why a separate process and not a path dep:
     * the web app is a full Phoenix application with its own ecto repos
@@ -13,45 +13,125 @@ defmodule TestNervesHub.Server do
   Org/product/device creation runs through Erlang distribution: the server
   is booted with a known node name and cookie, and `rpc/4` calls into
   `NervesHub.*` contexts directly.
+
+  ## One node or several
+
+  The end-to-end tests start a single node under the default name — the
+  "all" role, in the `dev` environment, which serves the web API and the
+  device endpoint at once. The load suite (`TestNervesHub.Load`) starts
+  several: that same node for the API plus any number of `device`-role
+  nodes, usually in the `prod` environment so they run the configuration
+  a deployment runs (websocket compression settings and the like live
+  under `config_env() == :prod`). Nodes sharing a database cluster
+  through `libcluster`'s Postgres strategy, exactly as deployed nodes do.
+
+  ## Options
+
+    * `:name` — registered name, default `#{inspect(__MODULE__)}`
+    * `:role` — `"all"` (default), `"web"` or `"device"` (`NERVES_HUB_APP`)
+    * `:mix_env` — `"dev"` (default) or `"prod"`
+    * `:web_port` / `:device_port` — defaults from `TestNervesHub.Config`
+    * `:status_port` — device-role health check port (prod only)
+    * `:migrate?` — run `ecto.migrate` first, default `true`
+    * `:prepare?` — run `deps.get` (and `compile` for prod), default `true`
+    * `:log` — file the node's output is appended to, default
+      `<work>/nerves_hub_web.log` (`<work>/<name>.log` for other names)
+    * `:env` — extra environment variables, `[{"KEY", "value"}]`
+    * `:cookie` — distribution cookie; nodes of one cluster share it.
+      Default: a fresh one per node.
   """
 
   use GenServer
   require Logger
 
-  alias TestNervesHub.Config
+  alias TestNervesHub.{Config, MixCmd}
 
-  @startup_timeout :timer.minutes(2)
+  @startup_timeout :timer.minutes(3)
 
   defmodule State do
     @moduledoc false
-    defstruct [:port, :node, :cookie, :web_port, :device_port, :ready?, :buffer, :awaiting]
+    defstruct [
+      :name,
+      :port,
+      :node,
+      :cookie,
+      :role,
+      :mix_env,
+      :web_port,
+      :device_port,
+      :status_port,
+      :log,
+      :os_pid,
+      :ready?,
+      :buffer,
+      :awaiting
+    ]
   end
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    name = Keyword.get(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, Keyword.put(opts, :name, name), name: name)
   end
 
-  @doc "Block until the web endpoint responds to HTTP."
-  @spec await_ready(timeout()) :: :ok | {:error, term()}
-  def await_ready(timeout \\ @startup_timeout) do
-    GenServer.call(__MODULE__, :await_ready, timeout + 1_000)
+  @doc "Block until the node's endpoint answers and RPC is up."
+  @spec await_ready(GenServer.server(), timeout()) :: :ok | {:error, term()}
+  def await_ready(server \\ __MODULE__, timeout \\ @startup_timeout)
+
+  def await_ready(timeout, _) when is_integer(timeout), do: await_ready(__MODULE__, timeout)
+
+  def await_ready(server, timeout) do
+    GenServer.call(server, :await_ready, timeout + 1_000)
   end
 
   @doc "Connect to the running node and return its node name."
-  @spec node_name() :: node()
-  def node_name, do: GenServer.call(__MODULE__, :node_name)
+  @spec node_name(GenServer.server()) :: node()
+  def node_name(server \\ __MODULE__), do: GenServer.call(server, :node_name)
+
+  @doc """
+  What the node is: `%{node, role, mix_env, web_port, device_port, os_pid}`.
+  The `os_pid` is the BEAM's, read from the node itself, so it is the one
+  to look up in `/proc` for RSS.
+  """
+  @spec info(GenServer.server()) :: map()
+  def info(server \\ __MODULE__), do: GenServer.call(server, :info)
 
   @doc """
   Call a function on the running nerves_hub_web node.
-  Returns the result or `{:badrpc, _}` on error.
+  Returns the result or raises on RPC failure.
   """
-  @spec rpc(module(), atom(), list(), timeout()) :: any()
-  def rpc(mod, fun, args, timeout \\ 30_000) do
-    {node, cookie} = GenServer.call(__MODULE__, :node_and_cookie)
+  @spec rpc(module(), atom(), list()) :: any()
+  def rpc(mod, fun, args), do: rpc(__MODULE__, mod, fun, args, 30_000)
+
+  # Two shapes share arity 4: `(mod, fun, args, timeout)` on the default
+  # node and `(server, mod, fun, args)` on a named one. The guards tell
+  # them apart by where the argument list sits.
+  @spec rpc(module() | GenServer.server(), atom() | module(), atom() | list(), timeout() | list()) ::
+          any()
+  def rpc(mod, fun, args, timeout)
+      when is_atom(fun) and is_list(args) and (is_integer(timeout) or timeout == :infinity),
+      do: rpc(__MODULE__, mod, fun, args, timeout)
+
+  def rpc(server, mod, fun, args) when is_atom(fun) and is_list(args),
+    do: rpc(server, mod, fun, args, 30_000)
+
+  @spec rpc(GenServer.server(), module(), atom(), list(), timeout()) :: any()
+  def rpc(server, mod, fun, args, timeout) do
+    {node, cookie} = GenServer.call(server, :node_and_cookie)
     ensure_connected!(node, cookie)
     :erpc.call(node, mod, fun, args, timeout)
   end
+
+  @doc "Evaluate Elixir source on the node; returns the value."
+  @spec eval(GenServer.server(), String.t(), timeout()) :: any()
+  def eval(server \\ __MODULE__, code, timeout \\ 30_000) do
+    {value, _binding} = rpc(server, Code, :eval_string, [code], timeout)
+    value
+  end
+
+  @doc "Stop the node (SIGTERM to mix, then the port closes)."
+  @spec stop(GenServer.server()) :: :ok
+  def stop(server \\ __MODULE__), do: GenServer.stop(server, :normal, :timer.seconds(30))
 
   @doc """
   Return the CA PEM blob clients should trust when talking to this server.
@@ -59,9 +139,17 @@ defmodule TestNervesHub.Server do
   """
   @spec ca_pem() :: String.t()
   def ca_pem do
-    path = Path.join([Config.nerves_hub_web_path(), "test", "fixtures", "ssl", "ca.pem"])
-    File.read!(path)
+    File.read!(Path.join(ssl_dir(), "ca.pem"))
   end
+
+  @doc "The dev/test fixture certificates directory in the web checkout."
+  @spec ssl_dir() :: Path.t()
+  def ssl_dir, do: Path.join([Config.nerves_hub_web_path(), "test", "fixtures", "ssl"])
+
+  # The hostname the fixture device certificate is issued for. Clients
+  # send it as SNI regardless of the IP they dial.
+  @doc false
+  def device_cert_hostname, do: "device.nerves-hub.org"
 
   @doc """
   IPv4 address to advertise as `WEB_HOST` to the spawned `nerves_hub_web`
@@ -146,43 +234,73 @@ defmodule TestNervesHub.Server do
   # --- GenServer ---
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
     Process.flag(:trap_exit, true)
 
-    Logger.info("nerves_hub_web: bootstrapping test server")
+    name = Keyword.fetch!(opts, :name)
+    role = Keyword.get(opts, :role, "all")
+    mix_env = Keyword.get(opts, :mix_env, "dev")
+    web_port = Keyword.get(opts, :web_port, Config.web_port())
+    device_port = Keyword.get(opts, :device_port, Config.device_port())
+    status_port = Keyword.get(opts, :status_port, web_port + 40)
+    log = Keyword.get(opts, :log, default_log(name))
+    label = label(name)
+
+    Logger.info("#{label}: bootstrapping (#{role}, #{mix_env})")
 
     pg = Config.postgres()
     ch = Config.clickhouse()
 
-    Logger.info("nerves_hub_web: ensuring postgres database #{inspect(pg[:database])}")
+    Logger.info("#{label}: ensuring postgres database #{inspect(pg[:database])}")
     :ok = ensure_postgres_database!(pg)
 
-    Logger.info("nerves_hub_web: ensuring clickhouse database #{inspect(ch[:database])}")
+    Logger.info("#{label}: ensuring clickhouse database #{inspect(ch[:database])}")
     :ok = ensure_clickhouse_database!(ch)
 
-    Logger.info("nerves_hub_web: preparing checkout (mix deps.get)")
-    :ok = prepare_web_project!()
+    if Keyword.get(opts, :prepare?, true) do
+      Logger.info(
+        "#{label}: preparing checkout (mix deps.get#{if mix_env == "prod", do: " + compile"})"
+      )
 
-    Logger.info("nerves_hub_web: running migrations (mix ecto.migrate)")
-    :ok = run_migrations!(pg, ch)
+      :ok = prepare_web_project!(mix_env)
+    end
+
+    if Keyword.get(opts, :migrate?, true) do
+      Logger.info("#{label}: running migrations (mix ecto.migrate)")
+      :ok = run_migrations!(pg, ch)
+    end
 
     suffix = :erlang.unique_integer([:positive])
-    cookie = "test_nerves_hub_#{suffix}"
+    cookie = Keyword.get(opts, :cookie, "test_nerves_hub_#{suffix}")
     node = :"nerves_hub_#{suffix}@127.0.0.1"
 
     Logger.info(
-      "nerves_hub_web: starting mix phx.server (node #{node}, web :#{Config.web_port()}, device :#{Config.device_port()})"
+      "#{label}: starting mix phx.server (node #{node}, web :#{web_port}, device :#{device_port})"
     )
 
-    port = start_phoenix(pg, ch, node, cookie)
+    env =
+      node_env(pg, ch, node, cookie, %{
+        role: role,
+        mix_env: mix_env,
+        web_port: web_port,
+        device_port: device_port,
+        status_port: status_port
+      }) ++ Keyword.get(opts, :env, [])
+
+    port = start_phoenix(env)
 
     {:ok,
      %State{
+       name: name,
        port: port,
        node: node,
        cookie: String.to_atom(cookie),
-       web_port: Config.web_port(),
-       device_port: Config.device_port(),
+       role: role,
+       mix_env: mix_env,
+       web_port: web_port,
+       device_port: device_port,
+       status_port: status_port,
+       log: log,
        ready?: false,
        buffer: "",
        awaiting: nil
@@ -195,15 +313,16 @@ defmodule TestNervesHub.Server do
   end
 
   def handle_call(:await_ready, _from, state) do
-    Logger.info("nerves_hub_web: waiting for HTTP endpoint on :#{state.web_port}")
+    label = label(state.name)
+    Logger.info("#{label}: waiting for HTTP endpoint on :#{probe_port(state)}")
 
     result =
-      with :ok <- poll_http(state.web_port, @startup_timeout) do
-        Logger.info("nerves_hub_web: HTTP up; waiting for RPC node #{state.node}")
+      with :ok <- poll_http(probe_port(state), state, @startup_timeout) do
+        Logger.info("#{label}: HTTP up; waiting for RPC node #{state.node}")
 
         case poll_node(state.node, state.cookie, @startup_timeout) do
           :ok ->
-            Logger.info("nerves_hub_web: ready (HTTP + RPC) — node=#{state.node}")
+            Logger.info("#{label}: ready (HTTP + RPC) — node=#{state.node}")
             :ok
 
           other ->
@@ -211,7 +330,17 @@ defmodule TestNervesHub.Server do
         end
       end
 
-    {:reply, result, %{state | ready?: result == :ok}}
+    state =
+      case result do
+        :ok ->
+          os_pid = :erpc.call(state.node, :os, :getpid, []) |> List.to_integer()
+          %{state | ready?: true, os_pid: os_pid}
+
+        _ ->
+          state
+      end
+
+    {:reply, result, state}
   end
 
   def handle_call(:node_name, _from, state), do: {:reply, state.node, state}
@@ -219,23 +348,39 @@ defmodule TestNervesHub.Server do
   def handle_call(:node_and_cookie, _from, state),
     do: {:reply, {state.node, state.cookie}, state}
 
+  def handle_call(:info, _from, state) do
+    info =
+      Map.take(state, [
+        :name,
+        :node,
+        :role,
+        :mix_env,
+        :web_port,
+        :device_port,
+        :status_port,
+        :os_pid,
+        :log
+      ])
+
+    {:reply, info, state}
+  end
+
   @impl true
   def handle_info({port, {:data, data}}, %State{port: port} = state) do
     # Tee everything to a file so we can grep for auth/socket events
     # after a failing test, without having to keep the buffer in memory.
-    log_path = Path.join(Config.work_dir(), "nerves_hub_web.log")
-    File.mkdir_p!(Path.dirname(log_path))
-    File.write!(log_path, data, [:append])
+    File.mkdir_p!(Path.dirname(state.log))
+    File.write!(state.log, data, [:append])
 
     if String.contains?(data, "[error]") or String.contains?(data, "[warning]") do
-      Logger.debug("nerves_hub_web: #{String.trim(data)}")
+      Logger.debug("#{label(state.name)}: #{String.trim(data)}")
     end
 
-    {:noreply, %{state | buffer: state.buffer <> data}}
+    {:noreply, state}
   end
 
   def handle_info({port, {:exit_status, code}}, %State{port: port} = state) do
-    Logger.error("nerves_hub_web exited with status #{code}")
+    Logger.error("#{label(state.name)} exited with status #{code}")
     {:stop, {:server_exited, code}, state}
   end
 
@@ -259,34 +404,81 @@ defmodule TestNervesHub.Server do
 
   # --- internals ---
 
-  defp start_phoenix(pg, ch, node, cookie) do
-    web_path = Config.nerves_hub_web_path()
-    web_port = Config.web_port()
-    device_port = Config.device_port()
+  defp label(__MODULE__), do: "nerves_hub_web"
+  defp label(name), do: inspect(name)
 
-    env = [
+  defp default_log(__MODULE__), do: Path.join(Config.work_dir(), "nerves_hub_web.log")
+
+  defp default_log(name) do
+    Path.join(Config.work_dir(), "#{name |> inspect() |> String.replace(~r/[^\w.-]/, "_")}.log")
+  end
+
+  # A device-role node has no web endpoint; its health check answers instead.
+  defp probe_port(%State{role: "device"} = state), do: state.status_port
+  defp probe_port(state), do: state.web_port
+
+  defp node_env(pg, ch, node, cookie, %{mix_env: "dev"} = n) do
+    [
       {"DATABASE_URL", database_url(pg)},
       {"CLICKHOUSE_URL", clickhouse_url(ch)},
-      {"WEB_PORT", to_string(web_port)},
+      {"WEB_PORT", to_string(n.web_port)},
       # device endpoint is web_port + 1 by default in the dev config
-      {"DEVICE_PORT", to_string(device_port)},
+      {"DEVICE_PORT", to_string(n.device_port)},
       # Firmware download URLs are built from WEB_HOST. We use the host's
       # primary LAN IPv4 so the same address resolves correctly from both
       # the QEMU guest (via SLIRP NAT) and the server itself (own-address
       # short-circuit to loopback) — required for the delta builder to
       # fetch the firmware files it advertises.
       {"WEB_HOST", host_address()},
+      {"NERVES_HUB_APP", n.role},
       {"MIX_ENV", "dev"},
       {"ERL_AFLAGS", "-name #{node} -setcookie #{cookie}"}
     ]
+  end
 
-    mix = System.find_executable("mix") || raise "mix not found on PATH"
+  # Everything `config/runtime.exs` insists on under `config_env() == :prod`,
+  # pointed at the same fixtures and databases the dev node uses. Secrets
+  # are per-run throwaways. No S3, no SMTP: those stay unset and the
+  # runtime config falls back to local files and the local mailer.
+  defp node_env(pg, ch, node, cookie, %{mix_env: "prod"} = n) do
+    host = host_address()
+
+    [
+      {"DATABASE_URL", database_url(pg)},
+      {"DATABASE_SSL", "false"},
+      {"DATABASE_AUTO_MIGRATOR", "false"},
+      {"CLICKHOUSE_URL", clickhouse_url(ch)},
+      {"NERVES_HUB_APP", n.role},
+      {"MIX_ENV", "prod"},
+      {"DEPLOY_ENV", "load"},
+      {"SECRET_KEY_BASE", random_secret(64)},
+      {"LIVE_VIEW_SIGNING_SALT", random_secret(16)},
+      {"WEB_HOST", host},
+      {"WEB_SCHEME", "http"},
+      {"WEB_PORT", to_string(n.web_port)},
+      {"HTTP_PORT", to_string(n.web_port)},
+      {"WEB_FORWARDED_IP_HEADER", "none"},
+      {"DEVICE_HOST", host},
+      {"DEVICE_PORT", to_string(n.device_port)},
+      {"DEVICE_HOST_STATUS_PORT", to_string(n.status_port)},
+      {"DEVICE_SSL_KEYFILE", Path.join(ssl_dir(), "#{device_cert_hostname()}-key.pem")},
+      {"DEVICE_SSL_CERTFILE", Path.join(ssl_dir(), "#{device_cert_hostname()}.pem")},
+      {"DEVICE_SSL_CACERTFILE", Path.join(ssl_dir(), "ca.pem")},
+      {"DEVICE_SHARED_SECRETS_ENABLED", "true"},
+      {"ERL_AFLAGS", "-name #{node} -setcookie #{cookie}"}
+    ]
+  end
+
+  defp random_secret(bytes), do: :crypto.strong_rand_bytes(bytes) |> Base.encode64(padding: false)
+
+  defp start_phoenix(env) do
+    web_path = Config.nerves_hub_web_path()
 
     Port.open({:spawn_executable, "/bin/sh"}, [
       :binary,
       :exit_status,
       :stderr_to_stdout,
-      {:args, ["-c", phoenix_wrapper(mix)]},
+      {:args, ["-c", phoenix_wrapper(MixCmd.shell())]},
       {:env, Enum.map(env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)},
       {:cd, String.to_charlist(web_path)}
     ])
@@ -313,9 +505,9 @@ defmodule TestNervesHub.Server do
   # tells you which gate it's stuck on, rare enough not to spam.
   @poll_log_interval_ms 5_000
 
-  defp poll_http(port, timeout) do
+  defp poll_http(port, state, timeout) do
     deadline = System.monotonic_time(:millisecond) + timeout
-    do_poll_http(port, deadline, System.monotonic_time(:millisecond))
+    do_poll_http(port, state, deadline, System.monotonic_time(:millisecond))
   end
 
   # Verifies we can reach the RPC node AND that NervesHub.Accounts is loaded.
@@ -366,28 +558,35 @@ defmodule TestNervesHub.Server do
     end
   end
 
-  defp do_poll_http(port, deadline, last_log) do
+  defp do_poll_http(port, state, deadline, last_log) do
     case Req.get("http://localhost:#{port}/", retry: false, receive_timeout: 1_000) do
       {:ok, %{status: status}} when status < 500 ->
         :ok
 
       reason ->
         if System.monotonic_time(:millisecond) > deadline do
-          {:error, {:http_timeout, reason}}
+          {:error, {:http_timeout, reason, tail_of_log(state)}}
         else
           now = System.monotonic_time(:millisecond)
 
           last_log =
             if now - last_log >= @poll_log_interval_ms do
-              Logger.info("nerves_hub_web: still waiting for HTTP on :#{port}")
+              Logger.info("#{label(state.name)}: still waiting for HTTP on :#{port}")
               now
             else
               last_log
             end
 
           Process.sleep(500)
-          do_poll_http(port, deadline, last_log)
+          do_poll_http(port, state, deadline, last_log)
         end
+    end
+  end
+
+  defp tail_of_log(%State{log: log}) do
+    case File.read(log) do
+      {:ok, contents} -> contents |> String.split("\n") |> Enum.take(-30) |> Enum.join("\n")
+      _ -> ""
     end
   end
 
@@ -419,17 +618,22 @@ defmodule TestNervesHub.Server do
   # Triggers the clone (if any) via Config.nerves_hub_web_path/0 and
   # makes sure deps are fetched. A fresh checkout will fail `ecto.migrate`
   # otherwise. Idempotent against an already-resolved local checkout.
-  defp prepare_web_project! do
+  # A prod node is compiled up front too: `mix phx.server` would do it,
+  # but minutes of silence inside the HTTP poll is not a helpful place
+  # for a compile error to surface.
+  defp prepare_web_project!(mix_env) do
     web_path = Config.nerves_hub_web_path()
 
-    {out, code} =
-      System.cmd("mix", ["deps.get"],
-        cd: web_path,
-        env: [{"MIX_ENV", "dev"}],
-        stderr_to_stdout: true
-      )
-
+    {out, code} = MixCmd.run(["deps.get"], cd: web_path, env: [{"MIX_ENV", mix_env}])
     if code != 0, do: raise("mix deps.get failed in #{web_path} (status #{code}):\n#{out}")
+
+    if mix_env == "prod" do
+      {out, code} = MixCmd.run(["compile"], cd: web_path, env: [{"MIX_ENV", "prod"}])
+
+      if code != 0,
+        do: raise("MIX_ENV=prod mix compile failed in #{web_path} (status #{code}):\n#{out}")
+    end
+
     :ok
   end
 
@@ -442,8 +646,7 @@ defmodule TestNervesHub.Server do
       {"MIX_ENV", "dev"}
     ]
 
-    {out, code} =
-      System.cmd("mix", ["ecto.migrate"], cd: web_path, env: env, stderr_to_stdout: true)
+    {out, code} = MixCmd.run(["ecto.migrate"], cd: web_path, env: env)
 
     if code != 0 do
       raise "ecto.migrate failed (status #{code}):\n#{out}"

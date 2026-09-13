@@ -16,7 +16,7 @@ defmodule TestNervesHub.QEMU do
   use GenServer
   require Logger
 
-  alias TestNervesHub.Config
+  alias TestNervesHub.{Config, MixCmd}
 
   @type t :: pid()
 
@@ -273,11 +273,7 @@ defmodule TestNervesHub.QEMU do
     ]
 
     {out, 0} =
-      System.cmd("mix", ["nerves.gen.qemu", opts.firmware],
-        cd: opts.project_path,
-        env: env,
-        stderr_to_stdout: true
-      )
+      MixCmd.run(["nerves.gen.qemu", opts.firmware], cd: opts.project_path, env: env)
 
     [_, command_block] = String.split(out, "Command:\n", parts: 2)
 
@@ -300,7 +296,17 @@ defmodule TestNervesHub.QEMU do
       #    (`hostfwd=tcp:127.0.0.1:10022-:22`). Only one process can bind
       #    that port; we don't use the SSH access anyway, so drop the
       #    hostfwd entirely.
-      args: args |> drop_hostfwd() |> replace_mac(random_locally_administered_mac()),
+      # 3. QEMU's user-mode network defaults to 10.0.2.0/24 with the guest
+      #    at 10.0.2.15. A host that itself lives in 10.0.2.0/24 (any VM
+      #    behind another SLIRP or passt) then advertises an address the
+      #    guest thinks is its own, and the device connects to nothing.
+      #    Moving the guest to its own subnet keeps the host's address
+      #    routable from inside, via SLIRP's NAT, whatever it happens to be.
+      args:
+        args
+        |> drop_hostfwd()
+        |> set_guest_subnet(Config.qemu_guest_subnet())
+        |> replace_mac(random_locally_administered_mac()),
       env: env
     }
   end
@@ -308,6 +314,18 @@ defmodule TestNervesHub.QEMU do
   defp replace_mac(args, mac) do
     Enum.map(args, fn arg ->
       Regex.replace(~r/mac=[0-9a-fA-F:]{17}/, arg, "mac=#{mac}")
+    end)
+  end
+
+  defp set_guest_subnet(args, nil), do: args
+
+  defp set_guest_subnet(args, subnet) do
+    Enum.map(args, fn arg ->
+      if String.starts_with?(arg, "user,") and not String.contains?(arg, ",net=") do
+        arg <> ",net=" <> subnet
+      else
+        arg
+      end
     end)
   end
 

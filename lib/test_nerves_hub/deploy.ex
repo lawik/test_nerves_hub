@@ -87,7 +87,8 @@ defmodule TestNervesHub.Deploy do
         product_id: product.id
       )
 
-    firmware = NervesHub.Firmwares.get_firmware_by_product_and_uuid!(product, #{inspect(firmware_uuid)})
+    {:ok, firmware} =
+      NervesHub.Firmwares.get_firmware_by_product_and_uuid(product, #{inspect(firmware_uuid)})
     user = NervesHub.Repo.get!(NervesHub.Accounts.User, #{fixtures.user.id})
 
     NervesHub.ManagedDeployments.create_deployment_release(dep, firmware, nil, user, %{})

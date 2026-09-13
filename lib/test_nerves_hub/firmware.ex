@@ -5,7 +5,7 @@ defmodule TestNervesHub.Firmware do
   baked into the project, matching the user's preferred workflow.
   """
 
-  alias TestNervesHub.Config
+  alias TestNervesHub.{Config, MixCmd}
 
   @doc """
   Build firmware. Returns the path to the resulting `.fw` artifact.
@@ -18,13 +18,18 @@ defmodule TestNervesHub.Firmware do
     # Hex cache is global; serialize anything that may write to it.
     # See FirmwareProject.with_hex_lock/1.
     TestNervesHub.FirmwareProject.with_hex_lock(fn ->
-      with {_, 0} <- run("mix", ["deps.get"], project_path, env),
-           {_, 0} <- run("mix", ["firmware"], project_path, env),
+      with {_, 0} <- MixCmd.run(["deps.get"], cd: project_path, env: env),
+           {_, 0} <- MixCmd.run(["firmware"], cd: project_path, env: env),
            {:ok, fw} <- locate_firmware(project_path, target) do
         {:ok, fw}
       else
-        {out, code} when is_binary(out) -> {:error, {:build_failed, code, out}}
-        {:error, _} = err -> err
+        {out, code} when is_binary(out) ->
+          name = Path.basename(project_path)
+          log = TestNervesHub.FirmwareProject.keep_log(name, "mix_firmware", out)
+          {:error, {:build_failed, code, log}}
+
+        {:error, _} = err ->
+          err
       end
     end)
   end
@@ -39,9 +44,5 @@ defmodule TestNervesHub.Firmware do
       [fw | _] -> {:ok, fw}
       [] -> {:error, :firmware_not_found}
     end
-  end
-
-  defp run(cmd, args, cd, env) do
-    System.cmd(cmd, args, cd: cd, env: env, stderr_to_stdout: true)
   end
 end

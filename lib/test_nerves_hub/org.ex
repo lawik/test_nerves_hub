@@ -13,7 +13,7 @@ defmodule TestNervesHub.Org do
     * `NervesHub.Accounts.create_user/1` — no `/users/register` route.
     * `NervesHub.Accounts.create_org/2` — no org-create API endpoint.
     * `NervesHub.Products.create_shared_secret_auth/1` — no API.
-    * `NervesHub.Products.get_product_by_org_id_and_name!/2` — used
+    * `NervesHub.Products.get_product_by_org_id_and_name/2` — used
       only to recover the product's numeric `id` (the API's product
       JSON view returns just `name`), so we can pass a real
       `%Product{}` into the shared_secret RPC.
@@ -55,10 +55,15 @@ defmodule TestNervesHub.Org do
     key_name = "tnh-#{slug}-key-#{unique}"
 
     # RPC bootstrap — no public API for user or org creation.
+    # User names reject digits, underscores and a few punctuation chars
+    # (`NervesHub.Accounts.User.validate_name/2`); the slug is a module
+    # name in snake_case, so scrub it rather than trust it.
+    user_name = "Test " <> String.replace(slug, ~r/[<>\/\\@:;{}\[\]|_=+*#\d]+/u, " ")
+
     {:ok, user} =
       Server.rpc(NervesHub.Accounts, :create_user, [
         %{
-          name: "Test #{slug}",
+          name: user_name,
           email: email,
           password: @password
         }
@@ -81,7 +86,7 @@ defmodule TestNervesHub.Org do
     # the CA is registered with nerves_hub_web so `NervesHub.SSL.verify_fun`
     # can validate incoming device handshakes against a known signer.
     ca = Signing.generate_ca("tnh-#{slug}-ca-#{unique}")
-    {:ok, _} = API.CACertificate.create(org.name, ca.cert_pem, auth, "tnh #{slug} ca")
+    :ok = register_ca!(org.name, ca, auth, "tnh #{slug} ca")
 
     {:ok, %{"data" => _product_data}} =
       API.Product.create(org.name, product_name, auth)
@@ -89,8 +94,8 @@ defmodule TestNervesHub.Org do
     # The product JSON view returns only `:name`, so we RPC just this
     # one lookup to recover the numeric id we need for the shared
     # secret RPC. Drop this when the API grows an id field.
-    product_record =
-      Server.rpc(NervesHub.Products, :get_product_by_org_id_and_name!, [
+    {:ok, product_record} =
+      Server.rpc(NervesHub.Products, :get_product_by_org_id_and_name, [
         org.id,
         product_name
       ])
@@ -175,6 +180,27 @@ defmodule TestNervesHub.Org do
     case API.request(:get, path, "", fixtures.auth) do
       {:ok, %{"data" => %{"connection_status" => "connected"}}} -> true
       _ -> false
+    end
+  end
+
+  # `NervesHubCLI.API.CACertificate.create/4` predates the ownership check
+  # and only sends `cert`, which the server now rejects. Fetch a
+  # verification token, sign a proof cert with the CA, and post both.
+  defp register_ca!(org_name, ca, auth, description) do
+    token_path = Path.join(API.CACertificate.path(org_name), "verification_token")
+
+    {:ok, %{"data" => %{"verification_token" => token}}} =
+      API.request(:get, token_path, "", auth)
+
+    params = %{
+      cert: Base.encode64(ca.cert_pem),
+      verification_cert: Base.encode64(Signing.generate_verification_cert(ca, token)),
+      description: description
+    }
+
+    case API.request(:post, API.CACertificate.path(org_name), params, auth) do
+      {:ok, %{"data" => _}} -> :ok
+      other -> raise "POST #{API.CACertificate.path(org_name)} failed: #{inspect(other)}"
     end
   end
 

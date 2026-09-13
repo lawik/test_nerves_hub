@@ -83,7 +83,7 @@ defmodule TestNervesHub.FirmwareUpdateTest do
   end
 
   # No HTTP API exposes "attach device to deployment", so this stays as
-  # an RPC bridge into NervesHub.Devices.update_deployment_group/2.
+  # an RPC bridge into NervesHub.Devices.Deployments.update_deployment_group/2.
   # Worth replacing once the API grows the operation.
   defp attach_device_to_deployment(identifier, deployment_name, fixtures) do
     code = """
@@ -96,7 +96,7 @@ defmodule TestNervesHub.FirmwareUpdateTest do
         product_id: #{fixtures.product.id}
       )
 
-    NervesHub.Devices.update_deployment_group(device, dep)
+    _ = NervesHub.Devices.Deployments.update_deployment_group(device, dep)
     :ok
     """
 

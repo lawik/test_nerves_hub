@@ -59,10 +59,13 @@ defmodule TestNervesHub.SharedSecretTest do
           30_000
         )
 
+      host = TestNervesHub.Server.host_address()
+      port = TestNervesHub.Config.device_port()
+
       tcp_probe =
         QEMU.eval(
           device,
-          ~s|:gen_tcp.connect(~c"10.0.2.2", 4901, [active: false], 5000)|
+          ~s|:gen_tcp.connect(~c"#{host}", #{port}, [active: false], 5000)|
         )
 
       ring_log =

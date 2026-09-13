@@ -8,7 +8,7 @@ defmodule TestNervesHub.FirmwareProject do
   generated `config/target.exs` so the same template can drive either mechanism.
   """
 
-  alias TestNervesHub.Config
+  alias TestNervesHub.{Config, MixCmd}
 
   @type auth ::
           {:shared_secret, product_key :: String.t(), product_secret :: String.t()}
@@ -37,7 +37,9 @@ defmodule TestNervesHub.FirmwareProject do
     path = opts[:path] || default_path(opts.name)
     File.mkdir_p!(Path.dirname(path))
 
-    with :ok <- ensure_project(path, opts.name),
+    with :ok <- write_tool_versions(Path.dirname(path)),
+         :ok <- ensure_archives(Path.dirname(path)),
+         :ok <- ensure_project(path, opts.name),
          :ok <- ensure_nerves_hub_link(path),
          :ok <- write_auth_files(path, opts.auth),
          :ok <- patch_target_config(path, opts) do
@@ -48,6 +50,36 @@ defmodule TestNervesHub.FirmwareProject do
   defp default_path(name) do
     work_dir = Application.get_env(:test_nerves_hub, :work_dir) || Config.work_dir()
     Path.join([work_dir, "firmware", name])
+  end
+
+  # Sits above every generated project so mise/asdf pick it up from the
+  # subprocess cwd. See `Config.firmware_tool_versions/0`.
+  defp write_tool_versions(dir) do
+    case Config.firmware_tool_versions() do
+      nil -> :ok
+      contents -> File.write(Path.join(dir, ".tool-versions"), String.trim(contents) <> "\n")
+    end
+  end
+
+  # Mix archives are installed per Elixir install, so the toolchain the
+  # firmware dir resolves to (see `write_tool_versions/1`) needs its own
+  # copies of `igniter_new` and `nerves_bootstrap` even when the runner's
+  # toolchain already has them. Checked once per run, installed if missing.
+  @required_archives ["igniter_new", "nerves_bootstrap"]
+
+  defp ensure_archives(dir) do
+    with_hex_lock(fn ->
+      {listing, 0} = MixCmd.run(["archive"], cd: dir)
+
+      missing = Enum.reject(@required_archives, &String.contains?(listing, "* #{&1}-"))
+
+      Enum.reduce_while(missing, :ok, fn archive, :ok ->
+        case MixCmd.run(["archive.install", "hex", archive, "--force"], cd: dir) do
+          {_out, 0} -> {:cont, :ok}
+          {out, code} -> {:halt, {:error, {:archive_install_failed, archive, code, out}}}
+        end
+      end)
+    end)
   end
 
   defp ensure_project(path, name) do
@@ -65,9 +97,9 @@ defmodule TestNervesHub.FirmwareProject do
       ]
 
       with_hex_lock(fn ->
-        case run("mix", args, cd: Path.dirname(path)) do
+        case run(args, cd: Path.dirname(path)) do
           {_out, 0} -> :ok
-          {out, code} -> {:error, {:igniter_new_failed, code, out}}
+          {out, code} -> {:error, {:igniter_new_failed, code, keep_log(name, "igniter_new", out)}}
         end
       end)
     end
@@ -81,9 +113,13 @@ defmodule TestNervesHub.FirmwareProject do
     package = Config.nerves_hub_link_package()
 
     with_hex_lock(fn ->
-      case run("mix", ["igniter.install", package, "--yes", "--yes-to-deps"], cd: path) do
-        {_out, 0} -> :ok
-        {out, code} -> {:error, {:igniter_install_failed, code, out}}
+      case run(["igniter.install", package, "--yes", "--yes-to-deps"], cd: path) do
+        {_out, 0} ->
+          :ok
+
+        {out, code} ->
+          name = Path.basename(path)
+          {:error, {:igniter_install_failed, code, keep_log(name, "igniter_install", out)}}
       end
     end)
   end
@@ -202,9 +238,23 @@ defmodule TestNervesHub.FirmwareProject do
     inspect({type, der}, limit: :infinity, printable_limit: :infinity, binaries: :as_binaries)
   end
 
-  defp run(cmd, args, opts) do
-    {out, code} = System.cmd(cmd, args, [stderr_to_stdout: true] ++ opts)
+  defp run(args, opts) do
+    {out, code} = MixCmd.run(args, opts)
     {scrub(out), code}
+  end
+
+  # A failed subprocess can print thousands of lines; `inspect` in the
+  # ExUnit failure truncates them to the least useful part. Keep the whole
+  # thing on disk and surface the path plus the tail.
+  @doc false
+  def keep_log(name, step, out) do
+    dir = Path.join(Config.work_dir(), "logs")
+    File.mkdir_p!(dir)
+    log = Path.join(dir, "#{name}-#{step}.log")
+    File.write!(log, out)
+
+    tail = out |> String.split("\n") |> Enum.take(-40) |> Enum.join("\n")
+    "full output in #{log}\n--- last 40 lines ---\n" <> tail
   end
 
   # Igniter's spinner emits ~20 frames/second of "\r\e[K<task> <char>" while

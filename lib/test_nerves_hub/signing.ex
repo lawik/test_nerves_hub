@@ -51,6 +51,36 @@ defmodule TestNervesHub.Signing do
   end
 
   @doc """
+  Prove ownership of a CA to nerves_hub_web.
+
+  Registering a CA certificate requires a short-lived "verification
+  certificate": one signed by the CA whose subjectAltName carries the
+  server-issued token as `urn:nerveshub:verify:<token>`. Signing it proves
+  the caller holds the CA key. Mirrors the flow in nerves_hub_web's
+  `CACertificateController` tests.
+  """
+  @spec generate_verification_cert(%{cert_pem: String.t(), key_pem: String.t()}, String.t()) ::
+          String.t()
+  def generate_verification_cert(%{cert_pem: ca_cert_pem, key_pem: ca_key_pem}, token) do
+    ca_cert = X509.Certificate.from_pem!(ca_cert_pem)
+    ca_key = X509.PrivateKey.from_pem!(ca_key_pem)
+    signing_key = X509.PrivateKey.new_ec(:secp256r1)
+
+    san =
+      X509.Certificate.Extension.subject_alt_name(
+        uniformResourceIdentifier: ~c"urn:nerveshub:verify:#{token}"
+      )
+
+    signing_key
+    |> X509.PublicKey.derive()
+    |> X509.Certificate.new("/CN=ownership-verification", ca_cert, ca_key,
+      extensions: [subject_alt_name: san],
+      validity: 1
+    )
+    |> X509.Certificate.to_pem()
+  end
+
+  @doc """
   Generate a device certificate + private key signed by the given CA. The
   CN is the device identifier — `NervesHub.SSL.verify_fun` uses CN to
   match the device row during JITP/registration.

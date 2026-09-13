@@ -34,6 +34,46 @@ defmodule TestNervesHub.Config do
     System.get_env("NERVES_HUB_LINK_PACKAGE", "nerves_hub_link")
   end
 
+  @doc """
+  Contents of the `.tool-versions` written above generated firmware
+  projects, so `mix firmware` runs with an Erlang/OTP whose major version
+  matches the Nerves system's — Nerves refuses to build otherwise.
+
+  Default: whatever the `nerves_hub_web` checkout pins, since both track
+  current OTP. Override with `TEST_NERVES_HUB_FIRMWARE_TOOL_VERSIONS`
+  (newline-separated `.tool-versions` lines, e.g.
+  `"elixir 1.20.3-otp-29\nerlang 29.0.5"`), or set it to `""` to inherit
+  the runner's toolchain.
+  """
+  @spec firmware_tool_versions() :: String.t() | nil
+  def firmware_tool_versions do
+    case System.get_env("TEST_NERVES_HUB_FIRMWARE_TOOL_VERSIONS") do
+      nil ->
+        path = Path.join(nerves_hub_web_path(), ".tool-versions")
+        if File.exists?(path), do: File.read!(path), else: nil
+
+      "" ->
+        nil
+
+      contents ->
+        String.replace(contents, "\\n", "\n")
+    end
+  end
+
+  @doc """
+  CIDR for QEMU's user-mode network, or `nil` to keep QEMU's default
+  (10.0.2.0/24). Defaults to 10.0.3.0/24 so a host that is itself on
+  10.0.2.0/24 stays reachable from the guest; see `TestNervesHub.QEMU`.
+  Override with `TEST_NERVES_HUB_QEMU_SUBNET`.
+  """
+  @spec qemu_guest_subnet() :: String.t() | nil
+  def qemu_guest_subnet do
+    case System.get_env("TEST_NERVES_HUB_QEMU_SUBNET", "10.0.3.0/24") do
+      "" -> nil
+      subnet -> subnet
+    end
+  end
+
   def work_dir, do: fetch!(:work_dir)
   def qemu_target, do: fetch!(:qemu_target)
   def web_port, do: fetch!(:web_port)
