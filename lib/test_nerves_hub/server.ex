@@ -615,24 +615,22 @@ defmodule TestNervesHub.Server do
     :ok
   end
 
-  # Triggers the clone (if any) via Config.nerves_hub_web_path/0 and
-  # makes sure deps are fetched. A fresh checkout will fail `ecto.migrate`
-  # otherwise. Idempotent against an already-resolved local checkout.
-  # A prod node is compiled up front too: `mix phx.server` would do it,
-  # but minutes of silence inside the HTTP poll is not a helpful place
-  # for a compile error to surface.
+  # Triggers the clone (if any) via Config.nerves_hub_web_path/0, makes
+  # sure deps are fetched, and compiles for the node's environment. The
+  # boot itself would compile too, but a full rebuild takes longer than
+  # the HTTP startup budget and its errors would surface as a silent
+  # timeout. Idempotent against an up-to-date build.
   defp prepare_web_project!(mix_env) do
     web_path = Config.nerves_hub_web_path()
+    env = [{"MIX_ENV", mix_env}]
 
-    {out, code} = MixCmd.run(["deps.get"], cd: web_path, env: [{"MIX_ENV", mix_env}])
+    {out, code} = MixCmd.run(["deps.get"], cd: web_path, env: env)
     if code != 0, do: raise("mix deps.get failed in #{web_path} (status #{code}):\n#{out}")
 
-    if mix_env == "prod" do
-      {out, code} = MixCmd.run(["compile"], cd: web_path, env: [{"MIX_ENV", "prod"}])
+    {out, code} = MixCmd.run(["compile"], cd: web_path, env: env)
 
-      if code != 0,
-        do: raise("MIX_ENV=prod mix compile failed in #{web_path} (status #{code}):\n#{out}")
-    end
+    if code != 0,
+      do: raise("MIX_ENV=#{mix_env} mix compile failed in #{web_path} (status #{code}):\n#{out}")
 
     :ok
   end
