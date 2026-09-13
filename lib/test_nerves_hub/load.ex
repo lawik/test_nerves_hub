@@ -131,6 +131,8 @@ defmodule TestNervesHub.Load do
     meta =
       scenario
       |> Map.from_struct()
+      # Keyword pairs don't encode as JSON; the report wants a map anyway.
+      |> Map.update!(:node_env, &Map.new/1)
       |> Map.merge(%{
         run_id: run_id,
         web_path: Config.nerves_hub_web_path(),
