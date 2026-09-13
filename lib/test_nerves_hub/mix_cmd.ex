@@ -40,10 +40,32 @@ defmodule TestNervesHub.MixCmd do
   """
   @spec run([String.t()], keyword()) :: {Collectable.t(), non_neg_integer()}
   def run(args, opts) when is_list(args) do
-    Keyword.fetch!(opts, :cd)
+    cd = Keyword.fetch!(opts, :cd)
     [exe | prefix] = argv()
-    System.cmd(exe, prefix ++ args, Keyword.put_new(opts, :stderr_to_stdout, true))
+    {out, code} = System.cmd(exe, prefix ++ args, Keyword.put_new(opts, :stderr_to_stdout, true))
+    warn_if_compiled(args, cd, out)
+    {out, code}
   end
+
+  # A task that was not asked to compile but did means the build was stale
+  # or broken, and that is worth knowing: the compile output otherwise
+  # vanishes with the successful task, and the next `phx.server` boot pays
+  # for whatever went wrong in it.
+  defp warn_if_compiled([task | _], cd, out) when task not in ["compile", "deps.compile"] do
+    if is_binary(out) and String.contains?(out, "Compiling ") do
+      lines =
+        out |> String.split("\n") |> Enum.filter(&String.contains?(&1, ["Compiling ", "==> "]))
+
+      require Logger
+
+      Logger.warning(
+        "mix #{task} in #{cd} compiled code it was not expected to (#{length(lines)} lines):\n" <>
+          Enum.join(Enum.take(lines, 12), "\n")
+      )
+    end
+  end
+
+  defp warn_if_compiled(_, _, _), do: :ok
 
   @doc "Shell-quoted command line for embedding in `sh -c` wrappers."
   @spec shell() :: String.t()
