@@ -9,8 +9,14 @@ defmodule TestNervesHub.Load.FleetTest do
 
     * `LOAD_MAX_RSS_PER_DEVICE_KB` — RSS growth per connected device over
       the hold, per device-role node (default 600)
-    * `LOAD_MAX_RETAINED_PER_DEVICE_KB` — RSS not released per device
-      after disconnect and settle (default 150)
+    * `LOAD_MAX_ERLANG_RETAINED_PER_DEVICE_KB` — `:erlang.memory(:total)`
+      not released per device after disconnect and settle (default 32).
+      RSS is not gated on retention: the C allocator keeps pages the BEAM
+      has freed, and that is not a leak.
+
+  Per-device figures carry the node's fixed costs spread over the fleet,
+  so run the gate with a few hundred devices (`LOAD_DEVICES`), not a
+  handful.
   """
 
   use ExUnit.Case, async: false
@@ -31,14 +37,14 @@ defmodule TestNervesHub.Load.FleetTest do
     assert summary.online_at_hold >= scenario.devices
 
     max_rss = env_int("LOAD_MAX_RSS_PER_DEVICE_KB", 600) * 1024
-    max_retained = env_int("LOAD_MAX_RETAINED_PER_DEVICE_KB", 150) * 1024
+    max_retained = env_int("LOAD_MAX_ERLANG_RETAINED_PER_DEVICE_KB", 32) * 1024
 
     for {node, s} <- summary.servers, s.role in ["device", "all"] do
       assert s.rss_per_device_bytes <= max_rss,
              "#{node}: #{div(s.rss_per_device_bytes, 1024)} kB RSS per device over #{div(max_rss, 1024)} kB"
 
-      assert s.rss_retained_per_device_bytes <= max_retained,
-             "#{node}: #{div(s.rss_retained_per_device_bytes, 1024)} kB per device not released after disconnect"
+      assert s.erlang_retained_per_device_bytes <= max_retained,
+             "#{node}: #{div(s.erlang_retained_per_device_bytes, 1024)} kB of Erlang memory per device not released after disconnect"
     end
   end
 

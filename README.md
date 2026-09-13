@@ -209,8 +209,9 @@ LOAD_DEVICES=1000 LOAD_DEVICE_HOSTS=2 LOAD_DEVICE_NODES=2 LOAD_RAMP=50 \
   LOAD_LABEL=my-branch mix load
 
 # As a regression gate (thresholds via LOAD_MAX_RSS_PER_DEVICE_KB and
-# LOAD_MAX_RETAINED_PER_DEVICE_KB):
-mix test --only load
+# LOAD_MAX_ERLANG_RETAINED_PER_DEVICE_KB; use a few hundred devices so
+# the node's fixed costs don't dominate the per-device figures):
+LOAD_DEVICES=300 mix test --only load
 ```
 
 A run writes `work/load/<run id>/{samples.jsonl,summary.json,report.md}`

@@ -11,8 +11,12 @@ defmodule TestNervesHub.Load.Report do
     * the same for `:erlang.memory(:total)`;
     * bytes of RSS per connected device over the hold: how much a device
       costs the node while it is connected;
-    * bytes of RSS that did not come back after disconnect, per device:
-      what a connect/disconnect cycle leaks, if anything.
+    * bytes of RSS, and of `:erlang.memory(:total)`, that did not come back
+      after disconnect, per device. The Erlang figure is the leak signal;
+      RSS also carries what the C allocator holds on to.
+
+  Per-device figures include the node's fixed costs spread over the
+  fleet, so they only settle once a fleet is a few hundred devices.
   """
 
   @type summary :: map()
@@ -50,6 +54,15 @@ defmodule TestNervesHub.Load.Report do
            rss_per_device_bytes: per_device(held.rss_kb - base.rss_kb, devices, held.channels),
            rss_retained_per_device_bytes:
              per_device(after_.rss_kb - base.rss_kb, devices, held.channels),
+           # The leak signal. RSS can stay up after the devices leave because
+           # the C allocator keeps freed pages; the BEAM's own accounting
+           # going back to baseline says nothing is still referenced.
+           erlang_retained_per_device_bytes:
+             per_device(
+               kb(after_.memory["total"]) - kb(base.memory["total"]),
+               devices,
+               held.channels
+             ),
            erlang_per_device_bytes:
              per_device(
                kb(held.memory["total"]) - kb(base.memory["total"]),
@@ -89,7 +102,8 @@ defmodule TestNervesHub.Load.Report do
       for {node, r} <- s.servers do
         "| #{node} | #{r.role} | #{r.rss_kb.baseline} | #{r.rss_kb.hold} | #{r.rss_kb.settled} | " <>
           "#{r.erlang_total_kb.baseline} | #{r.erlang_total_kb.hold} | #{r.erlang_total_kb.settled} | " <>
-          "#{r.channels_at_hold} | #{fmt_bytes(r.rss_per_device_bytes)} | #{fmt_bytes(r.rss_retained_per_device_bytes)} |"
+          "#{r.channels_at_hold} | #{fmt_bytes(r.rss_per_device_bytes)} | #{fmt_bytes(r.erlang_per_device_bytes)} | " <>
+          "#{fmt_bytes(r.rss_retained_per_device_bytes)} | #{fmt_bytes(r.erlang_retained_per_device_bytes)} |"
       end
 
     host_rows =
@@ -107,8 +121,8 @@ defmodule TestNervesHub.Load.Report do
 
     ## nerves_hub_web nodes
 
-    | node | role | RSS base kB | RSS hold kB | RSS settled kB | erl base kB | erl hold kB | erl settled kB | channels | RSS/device | retained/device |
-    | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | node | role | RSS base kB | RSS hold kB | RSS settled kB | erl base kB | erl hold kB | erl settled kB | channels | RSS/device | erl/device | RSS retained/device | erl retained/device |
+    | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
     #{Enum.join(server_rows, "\n")}
 
     ## device hosts
@@ -132,7 +146,8 @@ defmodule TestNervesHub.Load.Report do
         [
           "| #{role} RSS/device | #{fmt_bytes(ra.rss_per_device_bytes)} | #{fmt_bytes(rb.rss_per_device_bytes)} | #{pct(ra.rss_per_device_bytes, rb.rss_per_device_bytes)} |",
           "| #{role} erlang/device | #{fmt_bytes(ra.erlang_per_device_bytes)} | #{fmt_bytes(rb.erlang_per_device_bytes)} | #{pct(ra.erlang_per_device_bytes, rb.erlang_per_device_bytes)} |",
-          "| #{role} retained/device | #{fmt_bytes(ra.rss_retained_per_device_bytes)} | #{fmt_bytes(rb.rss_retained_per_device_bytes)} | #{pct(ra.rss_retained_per_device_bytes, rb.rss_retained_per_device_bytes)} |",
+          "| #{role} RSS retained/device | #{fmt_bytes(ra.rss_retained_per_device_bytes)} | #{fmt_bytes(rb.rss_retained_per_device_bytes)} | #{pct(ra.rss_retained_per_device_bytes, rb.rss_retained_per_device_bytes)} |",
+          "| #{role} erlang retained/device | #{fmt_bytes(ra[:erlang_retained_per_device_bytes])} | #{fmt_bytes(rb[:erlang_retained_per_device_bytes])} | #{pct(ra[:erlang_retained_per_device_bytes], rb[:erlang_retained_per_device_bytes])} |",
           "| #{role} RSS at hold kB | #{ra.rss_kb.hold} | #{rb.rss_kb.hold} | #{pct(ra.rss_kb.hold, rb.rss_kb.hold)} |"
         ]
       end
