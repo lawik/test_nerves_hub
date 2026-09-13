@@ -53,8 +53,9 @@ defmodule TestNervesHub.Load.Sampler do
 
     %{
       top_processes: top,
-      alloc_allocated: :recon_alloc.memory(:allocated),
-      alloc_used: :recon_alloc.memory(:usage),
+      alloc_allocated_bytes: :recon_alloc.memory(:allocated),
+      # A ratio, 0..1: how much of what the allocators hold is in use.
+      alloc_usage_ratio: :recon_alloc.memory(:usage),
       binary_leak_top: (for {pid, delta, _} <- :recon.bin_leak(5), do: %{pid: inspect(pid), delta: delta})
     }
     """)
