@@ -14,7 +14,10 @@ so no firmware project is vendored in this repo.
 
 System tools (on `$PATH`):
 
-* `mix` (Elixir 1.19+, Erlang/OTP 28+)
+* `mix` — with a toolchain per project: the runner needs Elixir 1.19+;
+  `nerves_hub_web` pins its own in `.tool-versions`, as does the
+  generated firmware. With [mise](https://mise.jdx.dev) installed the
+  runner resolves each automatically (see `TEST_NERVES_HUB_MIX`).
 * `qemu-system-aarch64`
 * `fwup`
 * `git`
@@ -33,11 +36,8 @@ A `docker-compose.yml` for both lives in the [nerves_hub_web repo].
 ```sh
 git clone https://github.com/<you>/test_nerves_hub.git
 cd test_nerves_hub
-# Install the igniter_new and nerves_bootstrap archives into the Elixir
-# install that the project's `.tool-versions` selects. Run them after
-# `cd` so any asdf-style version switch is already applied.
-mix archive.install hex igniter_new
-mix archive.install hex nerves_bootstrap
+# The igniter_new and nerves_bootstrap archives are installed into the
+# firmware toolchain automatically on first run if they are missing.
 mix deps.get
 mix test
 ```
@@ -75,6 +75,9 @@ so they don't collide with a developer's local `nerves_hub_dev` /
 | `TEST_NERVES_HUB_WEB_PORT`           | `4900`                                               | Web endpoint port. |
 | `TEST_NERVES_HUB_DEVICE_PORT`        | `4901`                                               | Device endpoint port (usually `web_port + 1`). |
 | `TEST_NERVES_HUB_WORK_DIR`           | `<repo>/work`                                        | Where clones, firmware projects, and logs live. |
+| `TEST_NERVES_HUB_MIX`                | autodetect                                           | Command prefix used to run `mix` in each project, e.g. `mise exec -- mix`. Defaults to `mise exec -- mix` when mise is installed, else plain `mix`, so each project's `.tool-versions` picks its own toolchain. |
+| `TEST_NERVES_HUB_FIRMWARE_TOOL_VERSIONS` | web checkout's `.tool-versions`                  | `.tool-versions` contents written above generated firmware projects, so the host OTP major matches the Nerves system's. `""` inherits the runner's toolchain. |
+| `TEST_NERVES_HUB_QEMU_SUBNET`        | `10.0.3.0/24`                                        | QEMU user-mode network for the guest, kept off 10.0.2.0/24 so a host that lives there stays reachable. `""` keeps QEMU's default. |
 
 ### Examples
 
@@ -162,6 +165,82 @@ end
 
 See `test/firmware_update_test.exs` for the full version.
 
+## Load testing
+
+Besides the QEMU-backed end-to-end tests, the repo carries a load suite:
+a fleet of *virtual devices* — real `nerves_hub_link` trees, one per
+device, hosted many to a BEAM — connected to a `nerves_hub_web` cluster
+whose memory is sampled throughout. It exists to answer, repeatably,
+"what does a connected device cost a device node, and does it come back
+when the device leaves?", so a branch can be checked against `main`.
+
+### Pieces
+
+* `device_host/` — a separate Mix project. Its `DeviceHost.Fleet` starts
+  N `NervesHubLink.Supervisor` instances from specs (identifier, shared
+  secret, endpoint, firmware metadata), each as its own
+  `NervesHubLink.Instance`. Depends on the `multi-instance` branch of
+  `lawik/nerves_hub_link`, which makes several connections per VM
+  possible; set `NERVES_HUB_LINK_PATH` to use a local checkout. The
+  host never includes `vintage_net`, so it will not touch the machine's
+  routes.
+* `TestNervesHub.Load.Cluster` — the API node (the same `all`-role dev
+  node the e2e tests use) plus any number of `device`-role
+  `nerves_hub_web` nodes, by default in `MIX_ENV=prod` so they run the
+  production configuration (websocket compression settings live there),
+  clustered through `libcluster`'s Postgres strategy as in a deployment.
+* `TestNervesHub.Load.Firmware` — a fwup archive built in a second, so
+  the product has a firmware and a deployment group without a Nerves
+  build.
+* `TestNervesHub.Load.Sampler` / `Report` — RSS, `:erlang.memory/0`,
+  process and channel counts per node on a timer; a summary with
+  RSS-per-device and retained-per-device figures; `compare/2` for two
+  runs.
+
+### Running
+
+```sh
+# 200 devices on one prod device node, hold 2 minutes
+LOAD_DEVICES=200 LOAD_HOLD=120 mix load
+
+# Everything a run knobs on (defaults in TestNervesHub.Load.Scenario):
+LOAD_DEVICES=1000 LOAD_DEVICE_HOSTS=2 LOAD_DEVICE_NODES=2 LOAD_RAMP=50 \
+  LOAD_HOLD=600 LOAD_SERIALIZER=msgpack LOAD_HEALTH_MINUTES=1 \
+  LOAD_LABEL=my-branch mix load
+
+# As a regression gate (thresholds via LOAD_MAX_RSS_PER_DEVICE_KB and
+# LOAD_MAX_RETAINED_PER_DEVICE_KB):
+mix test --only load
+```
+
+A run writes `work/load/<run id>/{samples.jsonl,summary.json,report.md}`
+and the node logs. Comparing a branch with `main` is two runs against
+two checkouts — each with its own databases, since the branch's
+migrations may differ — and one compare:
+
+```sh
+NERVES_HUB_WEB_SOURCE=../wt/main TEST_NERVES_HUB_DATABASE=tnh_load_main \
+  TEST_NERVES_HUB_CLICKHOUSE_DATABASE=tnh_load_main LOAD_LABEL=main mix load
+NERVES_HUB_WEB_SOURCE=../wt/branch TEST_NERVES_HUB_DATABASE=tnh_load_branch \
+  TEST_NERVES_HUB_CLICKHOUSE_DATABASE=tnh_load_branch LOAD_LABEL=branch mix load
+mix load.compare work/load/<main run>/summary.json work/load/<branch run>/summary.json
+```
+
+What a run does, in order: start the cluster and device hosts; create an
+org, product, shared secret, firmware and active deployment group; take a
+baseline sample; start devices at `LOAD_RAMP`/s round-robin over the
+device nodes until NervesHub counts them all online; hold; stop the
+devices; wait `LOAD_SETTLE` seconds; take the last sample. The device
+nodes ask for health reports every `LOAD_HEALTH_MINUTES` so the hold has
+the traffic a fleet has.
+
+Extending it is a matter of a new scenario field and whatever the fleet
+should do during the hold — `DeviceHost.Fleet` is reachable over
+`:erpc` from the runner (`TestNervesHub.Load.DeviceHost.rpc/4`), and a
+device is a normal `nerves_hub_link` instance, so anything the client can
+do (request an update, send a file, report an error) can be driven per
+device.
+
 ## How the pieces fit
 
 ```
@@ -210,10 +289,6 @@ surfaces (contexts via RPC, HTTP API via the CLI, hex / git installs of
 
 ## Caveats
 
-* The firmware update test currently times out on the device-side firmware
-  install step; the publish + deployment-release path works, but the
-  on-device swap needs more orchestrator investigation. See the TODO at the
-  bottom of `test/firmware_update_test.exs`.
 * Test databases (`test_nerves_hub_e2e`) are reused between runs — rows
   accumulate. Drop them with `psql -c 'drop database test_nerves_hub_e2e'`
   if you want a clean slate.

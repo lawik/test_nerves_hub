@@ -10,4 +10,5 @@ System.put_env("NERVES_HUB_URI", "http://localhost:#{web_port}")
 {:ok, _} = TestNervesHub.Server.start_link()
 :ok = TestNervesHub.Server.await_ready()
 
-ExUnit.start(capture_log: true, timeout: :timer.minutes(10))
+# Load tests run a whole fleet; opt in with `mix test --only load`.
+ExUnit.start(capture_log: true, timeout: :timer.minutes(10), exclude: [:load])
